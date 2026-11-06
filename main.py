@@ -29,11 +29,11 @@ def read_root():
 @app.post("/forecast")
 def get_forecast(req: ForecastRequest):
     try:
-        # Fetch real data (EUR/USD exchange rate via Yahoo Finance)
+        # Fetch real data (EUR/USD exchange rate via FRED API)
         ticker = yf.Ticker("EURUSD=X")
         hist = ticker.history(period="10y", interval="1mo")
         if hist.empty:
-            raise ValueError("No data returned from Yahoo Finance")
+            raise ValueError("No data returned from FRED API")
             
         current_spot = float(hist['Close'].iloc[-1])
         

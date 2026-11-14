@@ -62,25 +62,21 @@ def get_forecast(req: ForecastRequest):
         current_q = float(df['q'].iloc[-1])
         
         # 3. Estimate Dynamic OU Parameters via OLS
-        # q_t = c + phi * q_{t-1} + error
         df['q_lag'] = df['q'].shift(1)
         df_ols = df.dropna()
         slope, intercept, r_value, p_value, std_err = linregress(df_ols['q_lag'], df_ols['q'])
         
-        # Clip phi to avoid explosive or perfectly stationary processes
         phi = float(np.clip(slope, 0.01, 0.999))
-        q_bar = float(intercept / (1 - phi)) # Long-term mean (PPP Anchor)
+        q_bar = float(intercept / (1 - phi))
         
-        # Convert to continuous time (Annualized)
-        dt = 1 / 12 # monthly steps
+        dt = 1 / 12
         theta = -np.log(phi) / dt
         half_life = np.log(0.5) / np.log(phi) * dt
         
-        # Residual volatility
         residuals = df_ols['q'] - (intercept + phi * df_ols['q_lag'])
-        sigma = float(np.std(residuals) * np.sqrt(12)) # Annualized
+        sigma = float(np.std(residuals) * np.sqrt(12))
         
-        # 4. Regime Detection (GMM on rolling volatility of monthly returns)
+        # 4. Regime Detection (GMM)
         df['returns'] = df['s'].diff()
         df['vol'] = df['returns'].rolling(window=6).std().bfill()
         
@@ -89,7 +85,6 @@ def get_forecast(req: ForecastRequest):
         regimes = gmm.predict(df['vol'].values.reshape(-1, 1))
         current_regime = int(regimes[-1])
         
-        # Reconstruct PPP Fair Value from q_bar
         ppp_anchor = float(np.exp(q_bar - df['p_us'].iloc[-1] + df['p_ez'].iloc[-1]))
 
         # 5. Generate Forecast Distribution
@@ -105,14 +100,15 @@ def get_forecast(req: ForecastRequest):
         
         p_up = norm.cdf(mean_delta / std_delta) if std_delta > 0 else 0.5
         expected_rate = float(np.exp(np.log(current_spot) + mean_delta))
+        
         # 5.5 Build Historical Data for the Chart (Last 60 Months)
-historical_data = []
-df_hist = df.tail(60) # Grab last 5 years
-for date, row in df_hist.iterrows():
-    historical_data.append({
-        "date": date.strftime("%Y-%m-%d"),
-        "price": float(row['spot'])
-    })
+        historical_data = []
+        df_hist = df.tail(60)
+        for date, row in df_hist.iterrows():
+            historical_data.append({
+                "date": date.strftime("%Y-%m-%d"),
+                "price": float(row['spot'])
+            })
 
         # 6. Build Fan Chart Data
         fan_chart = []
@@ -157,7 +153,7 @@ for date, row in df_hist.iterrows():
                     "ci_90_high": float(np.exp(np.log(current_spot) + mean_delta + 1.645 * std_delta))
                 },
                 "historical_data": historical_data,
-"fan_chart": fan_chart
+                "fan_chart": fan_chart
             }
         }
     except Exception as e:

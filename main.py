@@ -3,12 +3,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
 import pandas as pd
-import yfinance as yf
+from fredapi import Fred
 from scipy.stats import norm
+from scipy.stats import linregress
+from sklearn.mixture import GaussianMixture
+import os
+import datetime
 
 app = FastAPI()
 
-# Allow FlutterFlow to access the API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,6 +19,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+FRED_API_KEY = os.getenv("FRED_API_KEY")
 
 class ForecastRequest(BaseModel):
     horizon_years: float = 3.0
@@ -29,52 +34,93 @@ def read_root():
 @app.post("/forecast")
 def get_forecast(req: ForecastRequest):
     try:
-        # Fetch real data (EUR/USD exchange rate via FRED API)
-        ticker = yf.Ticker("EURUSD=X")
-        hist = ticker.history(period="10y", interval="1mo")
-        if hist.empty:
-            raise ValueError("No data returned from FRED API")
-            
-        current_spot = float(hist['Close'].iloc[-1])
+        if not FRED_API_KEY:
+            raise ValueError("FRED_API_KEY environment variable is not set")
         
-        # Hardcode PPP anchor and half-life derived from our macro analysis
-        ppp_anchor = 1.1420 
-        half_life = 2.8
-        sigma = 0.035
-        dt = 1 / 12
+        fred = Fred(api_key=FRED_API_KEY)
         
-        # OU parameters
-        phi = 0.5 ** (dt / half_life) # Adjusted phi for monthly steps
+        # 1. Fetch Data (Spot, US CPI, EZ HICP)
+        spot_series = fred.get_series('DEXUSEU').dropna()
+        us_cpi = fred.get_series('CPIAUCSL').dropna()
+        ez_cpi = fred.get_series('CP0000EZ19M086NEST').dropna()
+        
+        # Align data to monthly frequency
+        df = pd.DataFrame({'spot': spot_series, 'us_cpi': us_cpi, 'ez_cpi': ez_cpi})
+        df = df.resample('ME').last().dropna() # Month-End frequency
+        df = df[df.index >= '1999-01-01'] # Official EUR era
+        
+        if len(df) < 36:
+            raise ValueError("Not enough historical data to estimate parameters")
+
+        # 2. Calculate Real Exchange Rate (q = s + p_us - p_ez)
+        df['s'] = np.log(df['spot'])
+        df['p_us'] = np.log(df['us_cpi'])
+        df['p_ez'] = np.log(df['ez_cpi'])
+        df['q'] = df['s'] + df['p_us'] - df['p_ez']
+        
+        current_spot = float(df['spot'].iloc[-1])
+        current_q = float(df['q'].iloc[-1])
+        
+        # 3. Estimate Dynamic OU Parameters via OLS
+        # q_t = c + phi * q_{t-1} + error
+        df['q_lag'] = df['q'].shift(1)
+        df_ols = df.dropna()
+        slope, intercept, r_value, p_value, std_err = linregress(df_ols['q_lag'], df_ols['q'])
+        
+        # Clip phi to avoid explosive or perfectly stationary processes
+        phi = float(np.clip(slope, 0.01, 0.999))
+        q_bar = float(intercept / (1 - phi)) # Long-term mean (PPP Anchor)
+        
+        # Convert to continuous time (Annualized)
+        dt = 1 / 12 # monthly steps
+        theta = -np.log(phi) / dt
+        half_life = np.log(0.5) / np.log(phi) * dt
+        
+        # Residual volatility
+        residuals = df_ols['q'] - (intercept + phi * df_ols['q_lag'])
+        sigma = float(np.std(residuals) * np.sqrt(12)) # Annualized
+        
+        # 4. Regime Detection (GMM on rolling volatility of monthly returns)
+        df['returns'] = df['s'].diff()
+        df['vol'] = df['returns'].rolling(window=6).std().bfill()
+        
+        gmm = GaussianMixture(n_components=2, random_state=42)
+        gmm.fit(df['vol'].values.reshape(-1, 1))
+        regimes = gmm.predict(df['vol'].values.reshape(-1, 1))
+        current_regime = int(regimes[-1])
+        
+        # Reconstruct PPP Fair Value from q_bar
+        ppp_anchor = float(np.exp(q_bar - df['p_us'].iloc[-1] + df['p_ez'].iloc[-1]))
+
+        # 5. Generate Forecast Distribution
         n_periods = req.horizon_years / dt
-        q_t = np.log(current_spot) - np.log(ppp_anchor)
+        phi_n = phi ** n_periods
         
-        # Calculate Drift & Variance
-        drift_q = (phi ** n_periods - 1) * (q_t)
+        drift_q = (phi_n - 1) * (current_q - q_bar)
         drift_infl = (req.pi_ez - req.pi_us) * req.horizon_years
         mean_delta = drift_q + drift_infl
         
         var_q = (sigma ** 2) * (1 - phi ** (2 * n_periods)) / (1 - phi ** 2)
         std_delta = np.sqrt(var_q)
         
-        # Probabilities & Intervals
         p_up = norm.cdf(mean_delta / std_delta) if std_delta > 0 else 0.5
-        expected_rate = np.exp(np.log(current_spot) + mean_delta)
-        ci_90_low = np.exp(np.log(current_spot) + mean_delta - 1.645 * std_delta)
-        ci_90_high = np.exp(np.log(current_spot) + mean_delta + 1.645 * std_delta)
+        expected_rate = float(np.exp(np.log(current_spot) + mean_delta))
         
-        # Build the Fan Chart Data
+        # 6. Build Fan Chart Data
         fan_chart = []
         steps = 12 
         for i in range(1, steps + 1):
             h = (req.horizon_years / steps) * i
             n = h / dt
-            m_drift = (phi ** n - 1) * q_t + drift_infl * (h / req.horizon_years)
+            m_drift = (phi ** n - 1) * (current_q - q_bar) + drift_infl * (h / req.horizon_years)
             v_q = (sigma ** 2) * (1 - phi ** (2 * n)) / (1 - phi ** 2)
             s_delta = np.sqrt(v_q)
             
+            future_date = (datetime.date.today() + datetime.timedelta(days=int(h*365))).strftime("%Y-%m-%d")
+            
             fan_chart.append({
                 "months_ahead": int(h * 12),
-                "date": str(pd.Timestamp.now() + pd.DateOffset(months=int(h * 12)))[:10],
+                "date": future_date,
                 "median": float(np.exp(np.log(current_spot) + m_drift)),
                 "mean": float(np.exp(np.log(current_spot) + m_drift)),
                 "q05": float(np.exp(np.log(current_spot) + m_drift - 1.645 * s_delta)),
@@ -90,17 +136,17 @@ def get_forecast(req: ForecastRequest):
                 "current_state": {
                     "spot_rate": current_spot,
                     "ppp_fair_value": ppp_anchor,
-                    "deviation_q": float(q_t),
-                    "half_life_years": half_life,
-                    "current_regime": 1,
+                    "deviation_q": current_q - q_bar,
+                    "half_life_years": float(half_life),
+                    "current_regime": current_regime,
                     "total_regimes": 2
                 },
                 "forecast": {
                     "p_up": float(p_up),
-                    "expected_rate": float(expected_rate),
-                    "median_rate": float(expected_rate),
-                    "ci_90_low": float(ci_90_low),
-                    "ci_90_high": float(ci_90_high)
+                    "expected_rate": expected_rate,
+                    "median_rate": expected_rate,
+                    "ci_90_low": float(np.exp(np.log(current_spot) + mean_delta - 1.645 * std_delta)),
+                    "ci_90_high": float(np.exp(np.log(current_spot) + mean_delta + 1.645 * std_delta))
                 },
                 "fan_chart": fan_chart
             }

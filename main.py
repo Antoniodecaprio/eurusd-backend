@@ -105,7 +105,15 @@ def get_forecast(req: ForecastRequest):
         
         p_up = norm.cdf(mean_delta / std_delta) if std_delta > 0 else 0.5
         expected_rate = float(np.exp(np.log(current_spot) + mean_delta))
-        
+        # 5.5 Build Historical Data for the Chart (Last 60 Months)
+historical_data = []
+df_hist = df.tail(60) # Grab last 5 years
+for date, row in df_hist.iterrows():
+    historical_data.append({
+        "date": date.strftime("%Y-%m-%d"),
+        "price": float(row['spot'])
+    })
+
         # 6. Build Fan Chart Data
         fan_chart = []
         steps = 12 
@@ -148,7 +156,8 @@ def get_forecast(req: ForecastRequest):
                     "ci_90_low": float(np.exp(np.log(current_spot) + mean_delta - 1.645 * std_delta)),
                     "ci_90_high": float(np.exp(np.log(current_spot) + mean_delta + 1.645 * std_delta))
                 },
-                "fan_chart": fan_chart
+                "historical_data": historical_data,
+"fan_chart": fan_chart
             }
         }
     except Exception as e:

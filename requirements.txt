@@ -6,3 +6,4 @@ scipy
 yfinance
 fredapi
 scikit-learn
+xgboost

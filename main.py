@@ -304,16 +304,14 @@ def get_short_term_forecast(req: ShortTermRequest):
                 json_data = response.json()
                 
                 if 'values' in json_data:
-                    # Twelve data returns newest first, we need oldest first
                     df = pd.DataFrame(json_data['values'])
                     df['datetime'] = pd.to_datetime(df['datetime'])
                     df = df.set_index('datetime').sort_index()
                     
-                    # Convert strings to floats
+                    # Convert strings to floats and rename columns safely
                     for col in ['open', 'high', 'low', 'close', 'volume']:
-                        df[col] = pd.to_numeric(df[col])
-                    
-                    # Rename to match our expected format
+                        if col in df.columns:
+                            df[col] = pd.to_numeric(df[col])
                     df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
             except Exception as e:
                 print(f"Twelve Data failed: {e}")
@@ -328,7 +326,13 @@ def get_short_term_forecast(req: ShortTermRequest):
         if df.empty or len(df) < 100:
             raise ValueError("Data unavailable from all sources")
             
-        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        # CRITICAL FIX: Check if required columns exist before selecting them
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        missing_cols = [c for c in required_cols if c not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Data source returned unexpected columns. Missing: {missing_cols}. Available: {df.columns.tolist()}")
+            
+        df = df[required_cols].copy()
         
         # 3. Causal Smoothing
         df['Clean_Close'] = df['Close'].ewm(span=10, adjust=False).mean()

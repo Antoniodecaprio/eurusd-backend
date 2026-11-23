@@ -12,6 +12,7 @@ import yfinance as yf
 import xgboost as xgb
 import os
 import datetime
+import requests
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -292,18 +293,40 @@ def get_short_term_forecast(req: ShortTermRequest):
         except Exception:
             macro_dev, macro_regime = 0.0, 0 
 
-        # 2. Robust Data Fetching
-        ticker = yf.Ticker("EURUSD=X")
-        df = ticker.history(period="60d", interval="1h")
+        # 2. ROBUST DATA FETCHING (Twelve Data first, yfinance fallback)
+        twelvedata_key = os.getenv("TWELVE_DATA_KEY")
+        df = pd.DataFrame()
         
-        # Fallbacks
+        if twelvedata_key:
+            try:
+                url = f"https://api.twelvedata.com/time_series?symbol=EUR/USD&interval=1h&outputsize=500&apikey={twelvedata_key}"
+                response = requests.get(url, timeout=10)
+                json_data = response.json()
+                
+                if 'values' in json_data:
+                    # Twelve data returns newest first, we need oldest first
+                    df = pd.DataFrame(json_data['values'])
+                    df['datetime'] = pd.to_datetime(df['datetime'])
+                    df = df.set_index('datetime').sort_index()
+                    
+                    # Convert strings to floats
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        df[col] = pd.to_numeric(df[col])
+                    
+                    # Rename to match our expected format
+                    df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+            except Exception as e:
+                print(f"Twelve Data failed: {e}")
+
+        # Fallback to yfinance if Twelve Data fails or key is missing
         if df.empty or len(df) < 100:
-            df = ticker.history(period="60d", interval="15m")
+            ticker = yf.Ticker("EURUSD=X")
+            df = ticker.history(period="60d", interval="1h")
+            if df.empty or len(df) < 100:
+                df = ticker.history(period="60d", interval="15m")
+                
         if df.empty or len(df) < 100:
-            df = ticker.history(period="2y", interval="1d")
-            
-        if df.empty or len(df) < 100:
-            raise ValueError("Data unavailable from all fallback sources")
+            raise ValueError("Data unavailable from all sources")
             
         df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
         

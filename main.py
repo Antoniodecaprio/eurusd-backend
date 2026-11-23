@@ -31,6 +31,21 @@ class ForecastRequest(BaseModel):
 class ShortTermRequest(BaseModel):
     forecast_days: int = 3
 
+def apply_fourier_denoising(prices, cutoff_freq=0.05):
+    """
+    Uses FFT to remove high-frequency noise from prices, keeping only the underlying trend.
+    """
+    fft_vals = np.fft.fft(prices)
+    fft_freqs = np.fft.fftfreq(len(prices))
+    
+    # Create a filter mask (keep only low frequencies)
+    mask = np.abs(fft_freqs) < cutoff_freq
+    
+    # Apply the mask and inverse FFT to get the denoised price
+    fft_vals_clean = fft_vals * mask
+    clean_prices = np.fft.ifft(fft_vals_clean).real
+    return clean_prices
+
 def fetch_and_prep_data():
     if not FRED_API_KEY:
         raise ValueError("FRED_API_KEY environment variable is not set")
@@ -246,22 +261,27 @@ def get_short_term_forecast(req: ShortTermRequest):
             
         df = df[['Close']].copy()
         
-        df['ret_1h'] = df['Close'].pct_change(1)
-        df['ret_4h'] = df['Close'].pct_change(4)
-        df['ret_24h'] = df['Close'].pct_change(24)
+        # 1. Apply Fourier Denoising to the Close price
+        df['Clean_Close'] = apply_fourier_denoising(df['Close'].values, cutoff_freq=0.05)
         
-        df['sma_10'] = df['Close'].rolling(window=10).mean()
-        df['sma_50'] = df['Close'].rolling(window=50).mean()
-        df['dist_sma'] = (df['Close'] - df['sma_10']) / df['sma_10']
+        # 2. Feature Engineering (Technical Indicators based on Clean Data)
+        df['ret_1h'] = df['Clean_Close'].pct_change(1)
+        df['ret_4h'] = df['Clean_Close'].pct_change(4)
+        df['ret_24h'] = df['Clean_Close'].pct_change(24)
+        
+        df['sma_10'] = df['Clean_Close'].rolling(window=10).mean()
+        df['sma_50'] = df['Clean_Close'].rolling(window=50).mean()
+        df['dist_sma'] = (df['Clean_Close'] - df['sma_10']) / df['sma_10']
         
         df['volatility'] = df['ret_1h'].rolling(window=24).std()
         
-        delta = df['Close'].diff()
+        delta = df['Clean_Close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
         df['rsi'] = 100 - (100 / (1 + rs))
         
+        # Target is based on the actual market close, not the denoised one
         periods_ahead = req.forecast_days * 24 
         df['target'] = (df['Close'].shift(-periods_ahead) > df['Close']).astype(int)
         

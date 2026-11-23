@@ -7,3 +7,4 @@ yfinance
 fredapi
 scikit-learn
 xgboost
+requests

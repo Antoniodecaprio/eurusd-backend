@@ -6,10 +6,14 @@ import pandas as pd
 from fredapi import Fred
 from scipy.stats import norm, linregress
 from sklearn.mixture import GaussianMixture
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import brier_score_loss
 import yfinance as yf
 import xgboost as xgb
 import os
 import datetime
+import warnings
+warnings.filterwarnings('ignore')
 
 app = FastAPI()
 
@@ -23,6 +27,10 @@ app.add_middleware(
 
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 
+# ==========================================
+# DATA MODELS
+# ==========================================
+
 class ForecastRequest(BaseModel):
     horizon_years: float = 3.0
     pi_us: float = 0.02
@@ -31,25 +39,14 @@ class ForecastRequest(BaseModel):
 class ShortTermRequest(BaseModel):
     forecast_days: int = 3
 
-def apply_fourier_denoising(prices, cutoff_freq=0.05):
-    """
-    Uses FFT to remove high-frequency noise from prices, keeping only the underlying trend.
-    """
-    fft_vals = np.fft.fft(prices)
-    fft_freqs = np.fft.fftfreq(len(prices))
-    
-    # Create a filter mask (keep only low frequencies)
-    mask = np.abs(fft_freqs) < cutoff_freq
-    
-    # Apply the mask and inverse FFT to get the denoised price
-    fft_vals_clean = fft_vals * mask
-    clean_prices = np.fft.ifft(fft_vals_clean).real
-    return clean_prices
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
 
-def fetch_and_prep_data():
+def fetch_macro_data():
+    """Fetches FRED data for the long-term OU model."""
     if not FRED_API_KEY:
-        raise ValueError("FRED_API_KEY environment variable is not set")
-    
+        raise ValueError("FRED_API_KEY environment variable not set")
     fred = Fred(api_key=FRED_API_KEY)
     spot_series = fred.get_series('DEXUSEU').dropna()
     us_cpi = fred.get_series('CPIAUCSL').dropna()
@@ -65,14 +62,49 @@ def fetch_and_prep_data():
     df['q'] = df['s'] + df['p_us'] - df['p_ez']
     return df
 
+def get_macro_state():
+    """Calculates current Macro Deviation and Regime for integration into Micro model."""
+    df = fetch_macro_data()
+    df['q_lag'] = df['q'].shift(1)
+    df_ols = df.dropna()
+    
+    slope, intercept, _, _, _ = linregress(df_ols['q_lag'], df_ols['q'])
+    phi = float(np.clip(slope, 0.01, 0.999))
+    q_bar = float(intercept / (1 - phi))
+    
+    current_q = float(df['q'].iloc[-1])
+    deviation = current_q - q_bar 
+    
+    df['returns'] = df['s'].diff()
+    df['vol'] = df['returns'].rolling(window=6).std().bfill()
+    gmm = GaussianMixture(n_components=2, random_state=42)
+    gmm.fit(df['vol'].values.reshape(-1, 1))
+    regimes = gmm.predict(df['vol'].values.reshape(-1, 1))
+    current_regime = int(regimes[-1])
+    
+    return deviation, current_regime
+
+def calculate_atr(df, window=14):
+    """Calculates Average True Range for dynamic stop-losses."""
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    return true_range.rolling(window=window).mean()
+
+# ==========================================
+# MACRO ENDPOINTS (LONG-TERM)
+# ==========================================
+
 @app.get("/")
 def read_root():
-    return {"status": "API is running"}
+    return {"status": "API is running - Unified Quant Engine Active"}
 
 @app.post("/forecast")
 def get_forecast(req: ForecastRequest):
     try:
-        df = fetch_and_prep_data()
+        df = fetch_macro_data()
         current_spot = float(df['spot'].iloc[-1])
         current_q = float(df['q'].iloc[-1])
         
@@ -108,10 +140,7 @@ def get_forecast(req: ForecastRequest):
         p_up = norm.cdf(mean_delta / std_delta) if std_delta > 0 else 0.5
         expected_rate = float(np.exp(np.log(current_spot) + mean_delta))
         
-        historical_data = []
-        for date, row in df.tail(60).iterrows():
-            historical_data.append({"date": date.strftime("%Y-%m-%d"), "price": float(row['spot'])})
-
+        historical_data = [{"date": d.strftime("%Y-%m-%d"), "price": float(r['spot'])} for d, r in df.tail(60).iterrows()]
         fan_chart = []
         steps = 12 
         for i in range(1, steps + 1):
@@ -161,7 +190,7 @@ def get_forecast(req: ForecastRequest):
 @app.post("/backtest")
 def run_backtest(req: ForecastRequest):
     try:
-        df = fetch_and_prep_data()
+        df = fetch_macro_data()
         horizon_months = int(req.horizon_years * 12)
         test_periods = 60
         
@@ -250,77 +279,146 @@ def run_backtest(req: ForecastRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ==========================================
+# MICRO ENDPOINT (SHORT-TERM ML ENGINE)
+# ==========================================
+
 @app.post("/short_term_forecast")
 def get_short_term_forecast(req: ShortTermRequest):
     try:
+        # 1. FUSION: Get Macro Bias First
+        try:
+            macro_dev, macro_regime = get_macro_state()
+        except Exception:
+            macro_dev, macro_regime = 0.0, 0 
+
+        # 2. Robust Data Fetching
         ticker = yf.Ticker("EURUSD=X")
         df = ticker.history(period="60d", interval="1h")
         
+        # Fallbacks
         if df.empty or len(df) < 100:
-            raise ValueError("Not enough intraday data returned from Yahoo Finance")
+            df = ticker.history(period="60d", interval="15m")
+        if df.empty or len(df) < 100:
+            df = ticker.history(period="2y", interval="1d")
             
-        df = df[['Close']].copy()
+        if df.empty or len(df) < 100:
+            raise ValueError("Data unavailable from all fallback sources")
+            
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
         
-        # 1. Apply Fourier Denoising to the Close price
-        df['Clean_Close'] = apply_fourier_denoising(df['Close'].values, cutoff_freq=0.05)
+        # 3. Causal Smoothing
+        df['Clean_Close'] = df['Close'].ewm(span=10, adjust=False).mean()
         
-        # 2. Feature Engineering (Technical Indicators based on Clean Data)
+        # 4. Feature Engineering
         df['ret_1h'] = df['Clean_Close'].pct_change(1)
-        df['ret_4h'] = df['Clean_Close'].pct_change(4)
         df['ret_24h'] = df['Clean_Close'].pct_change(24)
-        
-        df['sma_10'] = df['Clean_Close'].rolling(window=10).mean()
         df['sma_50'] = df['Clean_Close'].rolling(window=50).mean()
-        df['dist_sma'] = (df['Clean_Close'] - df['sma_10']) / df['sma_10']
-        
-        df['volatility'] = df['ret_1h'].rolling(window=24).std()
+        df['dist_sma'] = (df['Clean_Close'] - df['sma_50']) / df['sma_50']
         
         delta = df['Clean_Close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['rsi'] = 100 - (100 / (1 + rs))
+        df['rsi'] = 100 - (100 / (1 + (gain / loss)))
         
-        # Target is based on the actual market close, not the denoised one
+        df['atr'] = calculate_atr(df, window=14)
+        df['vol_mean'] = df['Volume'].rolling(window=24).mean()
+        df['whale_volume'] = np.where(df['Volume'] > (df['vol_mean'] * 1.5), 1, 0)
+
+        df['prev_high'] = df['High'].shift(1)
+        df['prev_low'] = df['Low'].shift(1)
+        df['bearish_sweep'] = np.where((df['High'] > df['prev_high']) & (df['Close'] < df['prev_high']) & (df['whale_volume'] == 1), -1, 0)
+        df['bullish_sweep'] = np.where((df['Low'] < df['prev_low']) & (df['Close'] > df['prev_low']) & (df['whale_volume'] == 1), 1, 0)
+        df['net_sweep'] = df['bullish_sweep'] + df['bearish_sweep']
+
+        # Macro Injection
+        df['macro_dev'] = macro_dev
+        df['macro_regime'] = macro_regime
+
+        # Target (3 days ahead)
         periods_ahead = req.forecast_days * 24 
         df['target'] = (df['Close'].shift(-periods_ahead) > df['Close']).astype(int)
         
+        features = ['ret_1h', 'ret_24h', 'dist_sma', 'rsi', 'whale_volume', 'net_sweep', 'macro_dev', 'macro_regime']
+        df[features] = df[features].shift(1) # Prevent leakage
+        
         df = df.dropna()
-        
-        if len(df) < 50:
+        if len(df) < 100:
             raise ValueError("Not enough valid data after feature engineering")
-            
-        features = ['ret_1h', 'ret_4h', 'ret_24h', 'dist_sma', 'volatility', 'rsi']
-        X = df[features]
-        y = df['target']
+
+        # 5. WALK-FORWARD VALIDATION & ADAPTIVE ENSEMBLE
+        split_idx = int(len(df) * 0.7)
+        train_df = df.iloc[:split_idx]
+        val_df = df.iloc[split_idx:]
+
+        X_train, y_train = train_df[features], train_df['target']
+        X_val, y_val = val_df[features], val_df['target']
+
+        xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=3, objective='binary:logistic', eval_metric='logloss')
+        rf_model = RandomForestClassifier(n_estimators=100, max_depth=4, random_state=42)
+
+        xgb_model.fit(X_train, y_train)
+        rf_model.fit(X_train, y_train)
+
+        # Calculate Brier Scores
+        xgb_preds = xgb_model.predict_proba(X_val)[:, 1]
+        rf_preds = rf_model.predict_proba(X_val)[:, 1]
         
-        X_train = X.iloc[:-1]
-        y_train = y.iloc[:-1]
-        X_live = X.iloc[-1:]
+        xgb_brier = brier_score_loss(y_val, xgb_preds)
+        rf_brier = brier_score_loss(y_val, rf_preds)
+
+        # Dynamic Weights
+        xgb_weight = (1 / (xgb_brier + 1e-5))
+        rf_weight = (1 / (rf_brier + 1e-5))
+        total_weight = xgb_weight + rf_weight
+        xgb_weight /= total_weight
+        rf_weight /= total_weight
+
+        # Retrain on FULL dataset before live prediction
+        xgb_model.fit(df[features], df['target'])
+        rf_model.fit(df[features], df['target'])
+
+        X_live = df[features].iloc[-1:]
+        p_up_xgb = xgb_model.predict_proba(X_live)[0][1]
+        p_up_rf = rf_model.predict_proba(X_live)[0][1]
         
-        model = xgb.XGBClassifier(
-            n_estimators=100, 
-            learning_rate=0.05, 
-            max_depth=3,
-            objective='binary:logistic',
-            use_label_encoder=False,
-            eval_metric='logloss'
-        )
-        model.fit(X_train, y_train)
-        
-        p_up = float(model.predict_proba(X_live)[0][1])
+        # Final Weighted Probability
+        p_up = (p_up_xgb * xgb_weight) + (p_up_rf * rf_weight)
+
         current_price = float(df['Close'].iloc[-1])
+        current_atr = float(df['atr'].iloc[-1])
         
-        if p_up > 0.6:
+        # 6. TRANSACTION COSTS & SIGNAL LOGIC
+        SPREAD_PIPS = 0.00015 
+        signal = "HOLD"
+        expected_move = current_atr * 1.5 
+        
+        if p_up > 0.60 and macro_dev >= -0.03 and expected_move > SPREAD_PIPS:
             signal = "BUY"
-            target_price = current_price * 1.005
-            stop_loss = current_price * 0.995
-        elif p_up < 0.4:
+            if df['net_sweep'].iloc[-1] == -1: signal = "HOLD"
+        elif p_up < 0.40 and macro_dev <= 0.03 and expected_move > SPREAD_PIPS:
             signal = "SELL"
-            target_price = current_price * 0.995
-            stop_loss = current_price * 1.005
+            if df['net_sweep'].iloc[-1] == 1: signal = "HOLD"
+
+        # 7. DYNAMIC KELLY POSITION SIZING
+        risk_reward_ratio = 2.0 
+        kelly_fraction = 0.0
+        
+        if signal == "BUY":
+            kelly_fraction = (p_up - ((1 - p_up) / risk_reward_ratio))
+        elif signal == "SELL":
+            kelly_fraction = ((1 - p_up) - (p_up / risk_reward_ratio))
+            
+        kelly_fraction = max(0.0, min(kelly_fraction, 0.05)) # Cap max risk at 5%
+
+        # 8. ATR RISK MANAGEMENT
+        if signal == "BUY":
+            target_price = current_price + (3.0 * current_atr) 
+            stop_loss = current_price - (1.5 * current_atr)
+        elif signal == "SELL":
+            target_price = current_price - (3.0 * current_atr)
+            stop_loss = current_price + (1.5 * current_atr)
         else:
-            signal = "HOLD"
             target_price = current_price
             stop_loss = current_price
 
@@ -331,10 +429,13 @@ def get_short_term_forecast(req: ShortTermRequest):
                 "forecast_days": req.forecast_days,
                 "probability_up": p_up,
                 "signal": signal,
-                "target_price": target_price,
-                "stop_loss": stop_loss,
-                "model_features": features,
-                "last_rsi": float(df['rsi'].iloc[-1])
+                "target_price": float(target_price),
+                "stop_loss": float(stop_loss),
+                "last_rsi": float(df['rsi'].iloc[-1]),
+                "macro_bias": "Bullish" if macro_dev > 0 else "Bearish",
+                "whale_trap_detected": bool(df['net_sweep'].iloc[-1] != 0),
+                "recommended_position_size_pct": float(kelly_fraction * 100),
+                "model_weights": {"xgb": float(xgb_weight), "rf": float(rf_weight)}
             }
         }
     except Exception as e:

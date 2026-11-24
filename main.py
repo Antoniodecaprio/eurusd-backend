@@ -482,6 +482,11 @@ def get_short_term_forecast(req: ShortTermRequest):
         rsi_low_bound = df['rsi'].tail(500).quantile(0.05)
         rsi_high_bound = df['rsi'].tail(500).quantile(0.95)
         
+        # --- CRITICAL FIX: Clamp the bounds to absolute extremes ---
+        # Never let the oversold bound drop below 25, or overbought rise above 75
+        rsi_low_bound = max(rsi_low_bound, 25.0) 
+        rsi_high_bound = min(rsi_high_bound, 75.0)
+        
         # Start with the base ML probability
         p_up_adjusted = p_up
         rsi_weight = 0.60 

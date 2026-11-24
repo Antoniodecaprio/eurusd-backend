@@ -375,18 +375,17 @@ def get_short_term_forecast(req: ShortTermRequest):
         df['sma_50'] = df['Clean_Close'].rolling(window=50).mean()
         df['dist_sma'] = (df['Clean_Close'] - df['sma_50']) / df['sma_50']
         
-        # --- NEW: TREND FILTER & Z-SCORE ---
+        # --- TREND FILTER & Z-SCORE ---
         df['trend_direction'] = np.where(df['Clean_Close'] > df['sma_50'], 1, -1)
         df['std_50'] = df['Clean_Close'].rolling(window=50).std()
         df['z_score'] = (df['Clean_Close'] - df['sma_50']) / (df['std_50'] + 1e-9)
         
-        # RSI (Fixed Division by Zero & Clamped)
+        # RSI (Fixed Division by Zero)
         delta = df['Clean_Close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / (loss + 1e-9) 
         df['rsi'] = 100 - (100 / (1 + rs))
-        df['rsi'] = df['rsi'].clip(lower=1.0, upper=99.0) # Clamp RSI
         
         df['atr'] = calculate_atr(df, window=14)
         df['vol_mean'] = df['Volume'].rolling(window=24).mean()
@@ -463,7 +462,7 @@ def get_short_term_forecast(req: ShortTermRequest):
         current_price = float(df['Close'].iloc[-1])
         current_atr = float(df['atr'].iloc[-1])
         
-        # --- NEW: EXPECTED REVERSAL TIME (OU Half-Life on Z-Score) ---
+        # --- EXPECTED REVERSAL TIME (OU Half-Life on Z-Score) ---
         recent_df = df.tail(100).copy()
         recent_df['x_lag'] = recent_df['z_score'].shift(1)
         recent_df = recent_df.dropna()
@@ -474,42 +473,66 @@ def get_short_term_forecast(req: ShortTermRequest):
         else:
             reversal_hours = 24.0
         
-        # 6. TRANSACTION COSTS, NEWS & SIGNAL LOGIC
+        # 6. DYNAMIC RSI & SIGNAL LOGIC (SEAMLESS PROBABILITY SHIFTING)
         SPREAD_PIPS = 0.00015 
-        signal = "HOLD"
         expected_move = current_atr * 1.5 
+        current_rsi = float(df['rsi'].iloc[-1])
+        
+        # Calculate dynamic RSI bounds (5th and 95th percentile of last 500 hours)
+        rsi_low_bound = df['rsi'].tail(500).quantile(0.05)
+        rsi_high_bound = df['rsi'].tail(500).quantile(0.95)
+        
+        # Start with the base ML probability
+        p_up_adjusted = p_up
+        rsi_weight = 0.60 
+        
+        # If RSI is extremely oversold, mathematically increase probability of going UP
+        if current_rsi < rsi_low_bound:
+            oversold_score = (rsi_low_bound - current_rsi) / rsi_low_bound
+            p_up_adjusted += (rsi_weight * oversold_score)
+            
+        # If RSI is extremely overbought, mathematically decrease probability of going UP
+        if current_rsi > rsi_high_bound:
+            overbought_score = (current_rsi - rsi_high_bound) / (100 - rsi_high_bound)
+            p_up_adjusted -= (rsi_weight * overbought_score)
+            
+        # Clamp final adjusted probability between 0 and 1
+        p_up_adjusted = float(np.clip(p_up_adjusted, 0.01, 0.99))
+        
+        # Determine Signal based on ADJUSTED probability
+        signal = "HOLD"
         
         if event_risk == "HIGH":
             signal = "HOLD" 
-        elif p_up > 0.60 and macro_dev >= -0.03 and expected_move > SPREAD_PIPS:
+        elif p_up_adjusted > 0.60 and macro_dev >= -0.03 and expected_move > SPREAD_PIPS:
             signal = "BUY"
             if df['net_sweep'].iloc[-1] == -1: signal = "HOLD"
-        elif p_up < 0.40 and macro_dev <= 0.03 and expected_move > SPREAD_PIPS:
+        elif p_up_adjusted < 0.40 and macro_dev <= 0.03 and expected_move > SPREAD_PIPS:
             signal = "SELL"
             if df['net_sweep'].iloc[-1] == 1: signal = "HOLD"
 
-        # --- NEW: TREND FILTER & EXTREME REVERSAL OVERRIDE ---
+        # --- TREND FILTER & EXTREME REVERSAL OVERRIDE ---
         current_trend = int(df['trend_direction'].iloc[-1])
         current_z = float(df['z_score'].iloc[-1])
         
         if signal == "SELL" and current_trend == 1:
-            signal = "HOLD" # Block sell if short-term trend is up
+            signal = "HOLD" 
         if signal == "BUY" and current_trend == -1:
-            signal = "HOLD" # Block buy if short-term trend is down
+            signal = "HOLD" 
             
         if signal == "SELL" and current_z < -2.0:
-            signal = "HOLD" # Don't sell if it's already extremely oversold
+            signal = "HOLD" 
         if signal == "BUY" and current_z > 2.0:
-            signal = "HOLD" # Don't buy if it's already extremely overbought
+            signal = "HOLD" 
 
-        # 7. DYNAMIC KELLY POSITION SIZING
+        # 7. DYNAMIC KELLY POSITION SIZING (Using Adjusted Probability)
         risk_reward_ratio = 2.0 
         kelly_fraction = 0.0
         
         if signal == "BUY":
-            kelly_fraction = (p_up - ((1 - p_up) / risk_reward_ratio))
+            kelly_fraction = (p_up_adjusted - ((1 - p_up_adjusted) / risk_reward_ratio))
         elif signal == "SELL":
-            kelly_fraction = ((1 - p_up) - (p_up / risk_reward_ratio))
+            kelly_fraction = ((1 - p_up_adjusted) - (p_up_adjusted / risk_reward_ratio))
             
         kelly_fraction = max(0.0, min(kelly_fraction, 0.05))
 
@@ -531,7 +554,7 @@ def get_short_term_forecast(req: ShortTermRequest):
             "data": {
                 "current_price": current_price,
                 "forecast_days": req.forecast_days,
-                "probability_up": float(p_up),
+                "probability_up": float(p_up_adjusted), # Return the seamlessly adjusted probability
                 "signal": signal,
                 "target_price": float(target_price),
                 "stop_loss": float(stop_loss),

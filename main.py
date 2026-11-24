@@ -46,7 +46,6 @@ class ShortTermRequest(BaseModel):
 # ==========================================
 
 def fetch_macro_data():
-    """Fetches FRED data for the long-term OU model."""
     if not FRED_API_KEY:
         raise ValueError("FRED_API_KEY environment variable not set")
     fred = Fred(api_key=FRED_API_KEY)
@@ -65,7 +64,6 @@ def fetch_macro_data():
     return df
 
 def get_macro_state():
-    """Calculates current Macro Deviation and Regime for integration into Micro model."""
     df = fetch_macro_data()
     df['q_lag'] = df['q'].shift(1)
     df_ols = df.dropna()
@@ -87,7 +85,6 @@ def get_macro_state():
     return deviation, current_regime
 
 def calculate_atr(df, window=14):
-    """Calculates Average True Range for dynamic stop-losses."""
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
@@ -96,7 +93,7 @@ def calculate_atr(df, window=14):
     return true_range.rolling(window=window).mean()
 
 # ==========================================
-# MACRO ENDPOINTS (LONG-TERM)
+# MACRO ENDPOINTS
 # ==========================================
 
 @app.get("/")
@@ -279,7 +276,7 @@ def run_backtest(req: ForecastRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
-# MICRO ENDPOINT (SHORT-TERM ML ENGINE)
+# MICRO ENDPOINT
 # ==========================================
 
 @app.post("/short_term_forecast")
@@ -343,12 +340,22 @@ def get_short_term_forecast(req: ShortTermRequest):
             if df_eur.empty or len(df_eur) < 100:
                 raise ValueError("Data unavailable from all sources")
             df = df_eur.copy()
-            df['Close_DXY'] = df['Close'] # Dummy fallback
+            if 'Close' in df.columns:
+                df['Close_DXY'] = df['Close'] 
         else:
             # Align EUR and DXY data
             df_eur = df_eur[['Open', 'High', 'Low', 'Close']].rename(columns={'Close': 'Close_EUR'})
             df_dxy = df_dxy[['Close']].rename(columns={'Close': 'Close_DXY'})
-            df = df_eur.join(df_dxy, how='inner').dropna()
+            
+            # --- CRITICAL TIMEZONE FIX ---
+            # Strip timezones to prevent "Cannot join tz-naive with tz-aware" error
+            if df_eur.index.tz is not None:
+                df_eur.index = df_eur.index.tz_localize(None)
+            if df_dxy.index.tz is not None:
+                df_dxy.index = df_dxy.index.tz_localize(None)
+                
+            # Some timestamps might be slightly off, so we outer join and forward fill
+            df = df_eur.join(df_dxy, how='outer').ffill().dropna()
 
         if 'Volume' not in df.columns or df['Volume'].sum() == 0:
             df['Volume'] = df['High'] - df['Low'] 
@@ -375,7 +382,7 @@ def get_short_term_forecast(req: ShortTermRequest):
         delta = df['Clean_Close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / (loss + 1e-9) # Prevent division by zero
+        rs = gain / (loss + 1e-9) 
         df['rsi'] = 100 - (100 / (1 + rs))
         
         df['atr'] = calculate_atr(df, window=14)
@@ -388,28 +395,25 @@ def get_short_term_forecast(req: ShortTermRequest):
         df['bullish_sweep'] = np.where((df['Low'] < df['prev_low']) & (df['Close'] > df['prev_low']) & (df['whale_volume'] == 1), 1, 0)
         df['net_sweep'] = df['bullish_sweep'] + df['bearish_sweep']
 
-        # ZigZag Pivot Features (Accuracy Upgrade)
+        # ZigZag Pivot Features
         window = 5
         df['swing_high'] = df['High'].rolling(window=window).max()
         df['swing_low'] = df['Low'].rolling(window=window).min()
         df['near_swing_high'] = np.where(df['Close'] > df['swing_high'] * 0.998, 1, 0)
         df['near_swing_low'] = np.where(df['Close'] < df['swing_low'] * 1.002, 1, 0)
 
-        # Macro Injection
         df['macro_dev'] = macro_dev
         df['macro_regime'] = macro_regime
 
-        # Target (3 days ahead)
         periods_ahead = req.forecast_days * 24 
         df['target'] = (df['Close'].shift(-periods_ahead) > df['Close']).astype(int)
         
         features = ['ret_1h', 'dxy_ret_1h', 'dxy_corr', 'ret_24h', 'dist_sma', 'rsi', 'whale_volume', 'net_sweep', 
                     'macro_dev', 'macro_regime', 'near_swing_high', 'near_swing_low']
         
-        # Drop missing features if DXY failed
         features = [f for f in features if f in df.columns]
         
-        df[features] = df[features].shift(1) # Prevent leakage
+        df[features] = df[features].shift(1) 
         df = df.dropna()
         
         if len(df) < 100:
@@ -423,32 +427,27 @@ def get_short_term_forecast(req: ShortTermRequest):
         X_train, y_train = train_df[features], train_df['target']
         X_val, y_val = val_df[features], val_df['target']
 
-        # Base Models
         base_xgb = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=3, objective='binary:logistic', eval_metric='logloss')
         base_rf = RandomForestClassifier(n_estimators=100, max_depth=4, random_state=42)
 
-        # Calibrated Models (Accuracy Upgrade)
         xgb_model = CalibratedClassifierCV(base_xgb, method='sigmoid', cv=3)
         rf_model = CalibratedClassifierCV(base_rf, method='sigmoid', cv=3)
 
         xgb_model.fit(X_train, y_train)
         rf_model.fit(X_train, y_train)
 
-        # Calculate Brier Scores
         xgb_preds = xgb_model.predict_proba(X_val)[:, 1]
         rf_preds = rf_model.predict_proba(X_val)[:, 1]
         
         xgb_brier = brier_score_loss(y_val, xgb_preds)
         rf_brier = brier_score_loss(y_val, rf_preds)
 
-        # Dynamic Weights
         xgb_weight = (1 / (xgb_brier + 1e-5))
         rf_weight = (1 / (rf_brier + 1e-5))
         total_weight = xgb_weight + rf_weight
         xgb_weight /= total_weight
         rf_weight /= total_weight
 
-        # Retrain on FULL dataset before live prediction
         xgb_model.fit(df[features], df['target'])
         rf_model.fit(df[features], df['target'])
 
@@ -456,7 +455,6 @@ def get_short_term_forecast(req: ShortTermRequest):
         p_up_xgb = xgb_model.predict_proba(X_live)[0][1]
         p_up_rf = rf_model.predict_proba(X_live)[0][1]
         
-        # Final Weighted Probability
         p_up = (p_up_xgb * xgb_weight) + (p_up_rf * rf_weight)
 
         current_price = float(df['Close'].iloc[-1])
@@ -468,7 +466,7 @@ def get_short_term_forecast(req: ShortTermRequest):
         expected_move = current_atr * 1.5 
         
         if event_risk == "HIGH":
-            signal = "HOLD" # Override if major news is coming
+            signal = "HOLD" 
         elif p_up > 0.60 and macro_dev >= -0.03 and expected_move > SPREAD_PIPS:
             signal = "BUY"
             if df['net_sweep'].iloc[-1] == -1: signal = "HOLD"
@@ -487,7 +485,7 @@ def get_short_term_forecast(req: ShortTermRequest):
             
         kelly_fraction = max(0.0, min(kelly_fraction, 0.05))
 
-        # 8. ATR RISK MANAGEMENT (Fixed HOLD targets)
+        # 8. ATR RISK MANAGEMENT
         if signal == "BUY":
             target_price = current_price + (3.0 * current_atr) 
             stop_loss = current_price - (1.5 * current_atr)
@@ -495,11 +493,9 @@ def get_short_term_forecast(req: ShortTermRequest):
             target_price = current_price - (3.0 * current_atr)
             stop_loss = current_price + (1.5 * current_atr)
         else:
-            # Show ATR band even on HOLD to prevent UI bug
             target_price = current_price + (1.5 * current_atr)
             stop_loss = current_price - (1.5 * current_atr)
 
-        # Format history for mini-chart
         history = [{"date": d.strftime("%Y-%m-%d %H:%M:%S"), "price": float(r['Close'])} for d, r in df.tail(48).iterrows()]
 
         return {

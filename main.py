@@ -98,7 +98,7 @@ def calculate_atr(df, window=14):
 
 @app.get("/")
 def read_root():
-    return {"status": "API is running - Elite Quant Engine Active"}
+    return {"status": "API is running - Optimized Quant Engine Active"}
 
 @app.post("/forecast")
 def get_forecast(req: ForecastRequest):
@@ -288,13 +288,13 @@ def get_short_term_forecast(req: ShortTermRequest):
         except Exception:
             macro_dev, macro_regime = 0.0, 0 
 
-        # 2. NEWS & EVENT RISK FILTER
+        # 2. NEWS & EVENT RISK FILTER (Strict 4s Timeout)
         twelvedata_key = os.getenv("TWELVE_DATA_KEY")
         event_risk = "LOW"
         if twelvedata_key:
             try:
                 cal_url = f"https://api.twelvedata.com/economic_calendar?country=US&apikey={twelvedata_key}"
-                cal_res = requests.get(cal_url, timeout=5).json()
+                cal_res = requests.get(cal_url, timeout=4).json()
                 if 'data' in cal_res:
                     for event in cal_res['data']:
                         if event.get('impact') == 'High':
@@ -302,14 +302,14 @@ def get_short_term_forecast(req: ShortTermRequest):
             except Exception:
                 pass
 
-        # 3. ROBUST DATA FETCHING (EUR/USD + DXY)
+        # 3. ROBUST DATA FETCHING (Strict 4s Timeouts)
         df_eur = pd.DataFrame()
         df_dxy = pd.DataFrame()
         
         if twelvedata_key:
             try:
                 url = f"https://api.twelvedata.com/time_series?symbol=EUR/USD&interval=1h&outputsize=500&apikey={twelvedata_key}"
-                response = requests.get(url, timeout=10)
+                response = requests.get(url, timeout=4)
                 json_data = response.json()
                 
                 if 'values' in json_data:
@@ -323,38 +323,39 @@ def get_short_term_forecast(req: ShortTermRequest):
             except Exception as e:
                 print(f"Twelve Data EUR failed: {e}")
 
-        # Fetch DXY (Dollar Index)
+        # Fetch DXY
         try:
             ticker_dxy = yf.Ticker("DX-Y.NYB")
-            df_dxy = ticker_dxy.history(period="60d", interval="1h")
+            df_dxy = ticker_dxy.history(period="60d", interval="1h", timeout=4)
         except Exception:
             pass
 
         # Fallbacks if Twelve Data fails
         if df_eur.empty or len(df_eur) < 100:
-            ticker_eur = yf.Ticker("EURUSD=X")
-            df_eur = ticker_eur.history(period="60d", interval="1h")
+            try:
+                ticker_eur = yf.Ticker("EURUSD=X")
+                df_eur = ticker_eur.history(period="60d", interval="1h", timeout=4)
+            except Exception:
+                pass
 
-        if df_eur.empty or df_dxy.empty or len(df_eur) < 100:
-            # Fallback: If DXY fails, just use EUR/USD
-            if df_eur.empty or len(df_eur) < 100:
-                raise ValueError("Data unavailable from all sources")
+        # Combine Data Safely
+        if df_eur.empty or len(df_eur) < 100:
+            raise ValueError("Data unavailable from all sources for EUR")
+            
+        if df_dxy.empty:
             df = df_eur.copy()
             if 'Close' in df.columns:
                 df['Close_DXY'] = df['Close'] 
         else:
-            # Align EUR and DXY data
             df_eur = df_eur[['Open', 'High', 'Low', 'Close']].rename(columns={'Close': 'Close_EUR'})
             df_dxy = df_dxy[['Close']].rename(columns={'Close': 'Close_DXY'})
             
-            # --- CRITICAL TIMEZONE FIX ---
-            # Strip timezones to prevent "Cannot join tz-naive with tz-aware" error
+            # TIMEZONE FIX
             if df_eur.index.tz is not None:
                 df_eur.index = df_eur.index.tz_localize(None)
             if df_dxy.index.tz is not None:
                 df_dxy.index = df_dxy.index.tz_localize(None)
                 
-            # Some timestamps might be slightly off, so we outer join and forward fill
             df = df_eur.join(df_dxy, how='outer').ffill().dropna()
 
         if 'Volume' not in df.columns or df['Volume'].sum() == 0:
@@ -419,7 +420,7 @@ def get_short_term_forecast(req: ShortTermRequest):
         if len(df) < 100:
             raise ValueError("Not enough valid data after feature engineering")
 
-        # 5. WALK-FORWARD VALIDATION & CALIBRATION
+        # 5. OPTIMIZED WALK-FORWARD VALIDATION & CALIBRATION
         split_idx = int(len(df) * 0.7)
         train_df = df.iloc[:split_idx]
         val_df = df.iloc[split_idx:]
@@ -427,11 +428,13 @@ def get_short_term_forecast(req: ShortTermRequest):
         X_train, y_train = train_df[features], train_df['target']
         X_val, y_val = val_df[features], val_df['target']
 
-        base_xgb = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=3, objective='binary:logistic', eval_metric='logloss')
-        base_rf = RandomForestClassifier(n_estimators=100, max_depth=4, random_state=42)
+        # REDUCED TREES TO 30 FOR MASSIVE SPEED BOOST
+        base_xgb = xgb.XGBClassifier(n_estimators=30, learning_rate=0.05, max_depth=3, objective='binary:logistic', eval_metric='logloss')
+        base_rf = RandomForestClassifier(n_estimators=30, max_depth=4, random_state=42)
 
-        xgb_model = CalibratedClassifierCV(base_xgb, method='sigmoid', cv=3)
-        rf_model = CalibratedClassifierCV(base_rf, method='sigmoid', cv=3)
+        # CV=2 SPLITS FOR FASTER CALIBRATION
+        xgb_model = CalibratedClassifierCV(base_xgb, method='sigmoid', cv=2)
+        rf_model = CalibratedClassifierCV(base_rf, method='sigmoid', cv=2)
 
         xgb_model.fit(X_train, y_train)
         rf_model.fit(X_train, y_train)
@@ -448,6 +451,7 @@ def get_short_term_forecast(req: ShortTermRequest):
         xgb_weight /= total_weight
         rf_weight /= total_weight
 
+        # Retrain on FULL dataset
         xgb_model.fit(df[features], df['target'])
         rf_model.fit(df[features], df['target'])
 

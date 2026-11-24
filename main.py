@@ -98,7 +98,7 @@ def calculate_atr(df, window=14):
 
 @app.get("/")
 def read_root():
-    return {"status": "API is running - Optimized Quant Engine Active"}
+    return {"status": "API is running - Elite Quant Engine Active"}
 
 @app.post("/forecast")
 def get_forecast(req: ForecastRequest):
@@ -288,7 +288,7 @@ def get_short_term_forecast(req: ShortTermRequest):
         except Exception:
             macro_dev, macro_regime = 0.0, 0 
 
-        # 2. NEWS & EVENT RISK FILTER (Strict 4s Timeout)
+        # 2. NEWS & EVENT RISK FILTER
         twelvedata_key = os.getenv("TWELVE_DATA_KEY")
         event_risk = "LOW"
         if twelvedata_key:
@@ -302,7 +302,7 @@ def get_short_term_forecast(req: ShortTermRequest):
             except Exception:
                 pass
 
-        # 3. ROBUST DATA FETCHING (Strict 4s Timeouts)
+        # 3. ROBUST DATA FETCHING
         df_eur = pd.DataFrame()
         df_dxy = pd.DataFrame()
         
@@ -323,14 +323,12 @@ def get_short_term_forecast(req: ShortTermRequest):
             except Exception as e:
                 print(f"Twelve Data EUR failed: {e}")
 
-        # Fetch DXY
         try:
             ticker_dxy = yf.Ticker("DX-Y.NYB")
             df_dxy = ticker_dxy.history(period="60d", interval="1h", timeout=4)
         except Exception:
             pass
 
-        # Fallbacks if Twelve Data fails
         if df_eur.empty or len(df_eur) < 100:
             try:
                 ticker_eur = yf.Ticker("EURUSD=X")
@@ -338,7 +336,6 @@ def get_short_term_forecast(req: ShortTermRequest):
             except Exception:
                 pass
 
-        # Combine Data Safely
         if df_eur.empty or len(df_eur) < 100:
             raise ValueError("Data unavailable from all sources for EUR")
             
@@ -350,7 +347,6 @@ def get_short_term_forecast(req: ShortTermRequest):
             df_eur = df_eur[['Open', 'High', 'Low', 'Close']].rename(columns={'Close': 'Close_EUR'})
             df_dxy = df_dxy[['Close']].rename(columns={'Close': 'Close_DXY'})
             
-            # TIMEZONE FIX
             if df_eur.index.tz is not None:
                 df_eur.index = df_eur.index.tz_localize(None)
             if df_dxy.index.tz is not None:
@@ -379,12 +375,18 @@ def get_short_term_forecast(req: ShortTermRequest):
         df['sma_50'] = df['Clean_Close'].rolling(window=50).mean()
         df['dist_sma'] = (df['Clean_Close'] - df['sma_50']) / df['sma_50']
         
-        # RSI (Fixed Division by Zero)
+        # --- NEW: TREND FILTER & Z-SCORE ---
+        df['trend_direction'] = np.where(df['Clean_Close'] > df['sma_50'], 1, -1)
+        df['std_50'] = df['Clean_Close'].rolling(window=50).std()
+        df['z_score'] = (df['Clean_Close'] - df['sma_50']) / (df['std_50'] + 1e-9)
+        
+        # RSI (Fixed Division by Zero & Clamped)
         delta = df['Clean_Close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / (loss + 1e-9) 
         df['rsi'] = 100 - (100 / (1 + rs))
+        df['rsi'] = df['rsi'].clip(lower=1.0, upper=99.0) # Clamp RSI
         
         df['atr'] = calculate_atr(df, window=14)
         df['vol_mean'] = df['Volume'].rolling(window=24).mean()
@@ -410,7 +412,7 @@ def get_short_term_forecast(req: ShortTermRequest):
         df['target'] = (df['Close'].shift(-periods_ahead) > df['Close']).astype(int)
         
         features = ['ret_1h', 'dxy_ret_1h', 'dxy_corr', 'ret_24h', 'dist_sma', 'rsi', 'whale_volume', 'net_sweep', 
-                    'macro_dev', 'macro_regime', 'near_swing_high', 'near_swing_low']
+                    'macro_dev', 'macro_regime', 'near_swing_high', 'near_swing_low', 'trend_direction', 'z_score']
         
         features = [f for f in features if f in df.columns]
         
@@ -428,11 +430,9 @@ def get_short_term_forecast(req: ShortTermRequest):
         X_train, y_train = train_df[features], train_df['target']
         X_val, y_val = val_df[features], val_df['target']
 
-        # REDUCED TREES TO 30 FOR MASSIVE SPEED BOOST
         base_xgb = xgb.XGBClassifier(n_estimators=30, learning_rate=0.05, max_depth=3, objective='binary:logistic', eval_metric='logloss')
         base_rf = RandomForestClassifier(n_estimators=30, max_depth=4, random_state=42)
 
-        # CV=2 SPLITS FOR FASTER CALIBRATION
         xgb_model = CalibratedClassifierCV(base_xgb, method='sigmoid', cv=2)
         rf_model = CalibratedClassifierCV(base_rf, method='sigmoid', cv=2)
 
@@ -451,7 +451,6 @@ def get_short_term_forecast(req: ShortTermRequest):
         xgb_weight /= total_weight
         rf_weight /= total_weight
 
-        # Retrain on FULL dataset
         xgb_model.fit(df[features], df['target'])
         rf_model.fit(df[features], df['target'])
 
@@ -463,6 +462,17 @@ def get_short_term_forecast(req: ShortTermRequest):
 
         current_price = float(df['Close'].iloc[-1])
         current_atr = float(df['atr'].iloc[-1])
+        
+        # --- NEW: EXPECTED REVERSAL TIME (OU Half-Life on Z-Score) ---
+        recent_df = df.tail(100).copy()
+        recent_df['x_lag'] = recent_df['z_score'].shift(1)
+        recent_df = recent_df.dropna()
+        if len(recent_df) > 10:
+            slope_z, _, _, _, _ = linregress(recent_df['x_lag'], recent_df['z_score'])
+            phi_z = float(np.clip(slope_z, 0.01, 0.999))
+            reversal_hours = float(np.log(0.5) / np.log(phi_z))
+        else:
+            reversal_hours = 24.0
         
         # 6. TRANSACTION COSTS, NEWS & SIGNAL LOGIC
         SPREAD_PIPS = 0.00015 
@@ -477,6 +487,20 @@ def get_short_term_forecast(req: ShortTermRequest):
         elif p_up < 0.40 and macro_dev <= 0.03 and expected_move > SPREAD_PIPS:
             signal = "SELL"
             if df['net_sweep'].iloc[-1] == 1: signal = "HOLD"
+
+        # --- NEW: TREND FILTER & EXTREME REVERSAL OVERRIDE ---
+        current_trend = int(df['trend_direction'].iloc[-1])
+        current_z = float(df['z_score'].iloc[-1])
+        
+        if signal == "SELL" and current_trend == 1:
+            signal = "HOLD" # Block sell if short-term trend is up
+        if signal == "BUY" and current_trend == -1:
+            signal = "HOLD" # Block buy if short-term trend is down
+            
+        if signal == "SELL" and current_z < -2.0:
+            signal = "HOLD" # Don't sell if it's already extremely oversold
+        if signal == "BUY" and current_z > 2.0:
+            signal = "HOLD" # Don't buy if it's already extremely overbought
 
         # 7. DYNAMIC KELLY POSITION SIZING
         risk_reward_ratio = 2.0 
@@ -516,6 +540,8 @@ def get_short_term_forecast(req: ShortTermRequest):
                 "whale_trap_detected": bool(df['net_sweep'].iloc[-1] != 0),
                 "event_risk": event_risk,
                 "dxy_correlation": float(df['dxy_corr'].iloc[-1]) if 'dxy_corr' in df.columns else 0.0,
+                "trend_direction": "Up" if current_trend == 1 else "Down",
+                "reversal_expectation_hours": reversal_hours,
                 "recommended_position_size_pct": float(kelly_fraction * 100),
                 "model_weights": {"xgb": float(xgb_weight), "rf": float(rf_weight)},
                 "history": history

@@ -7,6 +7,7 @@ from fredapi import Fred
 from scipy.stats import norm, linregress
 from sklearn.mixture import GaussianMixture
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import brier_score_loss
 import yfinance as yf
 import xgboost as xgb
@@ -100,7 +101,7 @@ def calculate_atr(df, window=14):
 
 @app.get("/")
 def read_root():
-    return {"status": "API is running - Unified Quant Engine Active"}
+    return {"status": "API is running - Elite Quant Engine Active"}
 
 @app.post("/forecast")
 def get_forecast(req: ForecastRequest):
@@ -198,10 +199,7 @@ def run_backtest(req: ForecastRequest):
         if len(df) < test_periods + horizon_months:
             raise ValueError("Not enough data for this backtest horizon")
             
-        probs_up = []
-        actuals = []
-        hits_50 = []
-        hits_90 = []
+        probs_up, actuals, hits_50, hits_90 = [], [], [], []
         
         for i in range(len(df) - test_periods - horizon_months, len(df) - horizon_months):
             train_df = df.iloc[:i].dropna()
@@ -293,9 +291,23 @@ def get_short_term_forecast(req: ShortTermRequest):
         except Exception:
             macro_dev, macro_regime = 0.0, 0 
 
-        # 2. ROBUST DATA FETCHING (Twelve Data first, yfinance fallback)
+        # 2. NEWS & EVENT RISK FILTER
         twelvedata_key = os.getenv("TWELVE_DATA_KEY")
-        df = pd.DataFrame()
+        event_risk = "LOW"
+        if twelvedata_key:
+            try:
+                cal_url = f"https://api.twelvedata.com/economic_calendar?country=US&apikey={twelvedata_key}"
+                cal_res = requests.get(cal_url, timeout=5).json()
+                if 'data' in cal_res:
+                    for event in cal_res['data']:
+                        if event.get('impact') == 'High':
+                            event_risk = "HIGH"
+            except Exception:
+                pass
+
+        # 3. ROBUST DATA FETCHING (EUR/USD + DXY)
+        df_eur = pd.DataFrame()
+        df_dxy = pd.DataFrame()
         
         if twelvedata_key:
             try:
@@ -304,51 +316,67 @@ def get_short_term_forecast(req: ShortTermRequest):
                 json_data = response.json()
                 
                 if 'values' in json_data:
-                    df = pd.DataFrame(json_data['values'])
-                    df['datetime'] = pd.to_datetime(df['datetime'])
-                    df = df.set_index('datetime').sort_index()
-                    
-                    # Convert strings to floats
-                    for col in ['open', 'high', 'low', 'close']: # Note: We removed volume here
-                        if col in df.columns:
-                            df[col] = pd.to_numeric(df[col])
-                    
-                    # Rename to match our expected format
-                    df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'})
+                    df_eur = pd.DataFrame(json_data['values'])
+                    df_eur['datetime'] = pd.to_datetime(df_eur['datetime'])
+                    df_eur = df_eur.set_index('datetime').sort_index()
+                    for col in ['open', 'high', 'low', 'close']:
+                        if col in df_eur.columns:
+                            df_eur[col] = pd.to_numeric(df_eur[col])
+                    df_eur = df_eur.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'})
             except Exception as e:
-                print(f"Twelve Data failed: {e}")
+                print(f"Twelve Data EUR failed: {e}")
 
-        # Fallback to yfinance if Twelve Data fails or key is missing
-        if df.empty or len(df) < 100:
-            ticker = yf.Ticker("EURUSD=X")
-            df = ticker.history(period="60d", interval="1h")
-            if df.empty or len(df) < 100:
-                df = ticker.history(period="60d", interval="15m")
-                
-        if df.empty or len(df) < 100:
-            raise ValueError("Data unavailable from all sources")
+        # Fetch DXY (Dollar Index)
+        try:
+            ticker_dxy = yf.Ticker("DX-Y.NYB")
+            df_dxy = ticker_dxy.history(period="60d", interval="1h")
+        except Exception:
+            pass
 
-        # --- CRITICAL FIX: SYNTHETIC VOLUME PROXY ---
-        # Forex has no centralized volume. If it's missing, we proxy it with High - Low
+        # Fallbacks if Twelve Data fails
+        if df_eur.empty or len(df_eur) < 100:
+            ticker_eur = yf.Ticker("EURUSD=X")
+            df_eur = ticker_eur.history(period="60d", interval="1h")
+
+        if df_eur.empty or df_dxy.empty or len(df_eur) < 100:
+            # Fallback: If DXY fails, just use EUR/USD
+            if df_eur.empty or len(df_eur) < 100:
+                raise ValueError("Data unavailable from all sources")
+            df = df_eur.copy()
+            df['Close_DXY'] = df['Close'] # Dummy fallback
+        else:
+            # Align EUR and DXY data
+            df_eur = df_eur[['Open', 'High', 'Low', 'Close']].rename(columns={'Close': 'Close_EUR'})
+            df_dxy = df_dxy[['Close']].rename(columns={'Close': 'Close_DXY'})
+            df = df_eur.join(df_dxy, how='inner').dropna()
+
         if 'Volume' not in df.columns or df['Volume'].sum() == 0:
             df['Volume'] = df['High'] - df['Low'] 
             
-        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        df = df[required_cols].copy()
-        
-        # 3. Causal Smoothing
-        df['Clean_Close'] = df['Close'].ewm(span=10, adjust=False).mean()
+        df['Close'] = df['Close_EUR'] if 'Close_EUR' in df.columns else df['Close']
         
         # 4. Feature Engineering
+        df['Clean_Close'] = df['Close'].ewm(span=10, adjust=False).mean()
         df['ret_1h'] = df['Clean_Close'].pct_change(1)
         df['ret_24h'] = df['Clean_Close'].pct_change(24)
+        
+        if 'Close_DXY' in df.columns:
+            df['Clean_DXY'] = df['Close_DXY'].ewm(span=10, adjust=False).mean()
+            df['dxy_ret_1h'] = df['Clean_DXY'].pct_change(1)
+            df['dxy_corr'] = df['ret_1h'].rolling(24).corr(df['dxy_ret_1h'])
+        else:
+            df['dxy_ret_1h'] = 0.0
+            df['dxy_corr'] = 0.0
+
         df['sma_50'] = df['Clean_Close'].rolling(window=50).mean()
         df['dist_sma'] = (df['Clean_Close'] - df['sma_50']) / df['sma_50']
         
+        # RSI (Fixed Division by Zero)
         delta = df['Clean_Close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        df['rsi'] = 100 - (100 / (1 + (gain / loss)))
+        rs = gain / (loss + 1e-9) # Prevent division by zero
+        df['rsi'] = 100 - (100 / (1 + rs))
         
         df['atr'] = calculate_atr(df, window=14)
         df['vol_mean'] = df['Volume'].rolling(window=24).mean()
@@ -360,6 +388,13 @@ def get_short_term_forecast(req: ShortTermRequest):
         df['bullish_sweep'] = np.where((df['Low'] < df['prev_low']) & (df['Close'] > df['prev_low']) & (df['whale_volume'] == 1), 1, 0)
         df['net_sweep'] = df['bullish_sweep'] + df['bearish_sweep']
 
+        # ZigZag Pivot Features (Accuracy Upgrade)
+        window = 5
+        df['swing_high'] = df['High'].rolling(window=window).max()
+        df['swing_low'] = df['Low'].rolling(window=window).min()
+        df['near_swing_high'] = np.where(df['Close'] > df['swing_high'] * 0.998, 1, 0)
+        df['near_swing_low'] = np.where(df['Close'] < df['swing_low'] * 1.002, 1, 0)
+
         # Macro Injection
         df['macro_dev'] = macro_dev
         df['macro_regime'] = macro_regime
@@ -368,14 +403,19 @@ def get_short_term_forecast(req: ShortTermRequest):
         periods_ahead = req.forecast_days * 24 
         df['target'] = (df['Close'].shift(-periods_ahead) > df['Close']).astype(int)
         
-        features = ['ret_1h', 'ret_24h', 'dist_sma', 'rsi', 'whale_volume', 'net_sweep', 'macro_dev', 'macro_regime']
-        df[features] = df[features].shift(1) # Prevent leakage
+        features = ['ret_1h', 'dxy_ret_1h', 'dxy_corr', 'ret_24h', 'dist_sma', 'rsi', 'whale_volume', 'net_sweep', 
+                    'macro_dev', 'macro_regime', 'near_swing_high', 'near_swing_low']
         
+        # Drop missing features if DXY failed
+        features = [f for f in features if f in df.columns]
+        
+        df[features] = df[features].shift(1) # Prevent leakage
         df = df.dropna()
+        
         if len(df) < 100:
             raise ValueError("Not enough valid data after feature engineering")
 
-        # 5. WALK-FORWARD VALIDATION & ADAPTIVE ENSEMBLE
+        # 5. WALK-FORWARD VALIDATION & CALIBRATION
         split_idx = int(len(df) * 0.7)
         train_df = df.iloc[:split_idx]
         val_df = df.iloc[split_idx:]
@@ -383,8 +423,13 @@ def get_short_term_forecast(req: ShortTermRequest):
         X_train, y_train = train_df[features], train_df['target']
         X_val, y_val = val_df[features], val_df['target']
 
-        xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=3, objective='binary:logistic', eval_metric='logloss')
-        rf_model = RandomForestClassifier(n_estimators=100, max_depth=4, random_state=42)
+        # Base Models
+        base_xgb = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=3, objective='binary:logistic', eval_metric='logloss')
+        base_rf = RandomForestClassifier(n_estimators=100, max_depth=4, random_state=42)
+
+        # Calibrated Models (Accuracy Upgrade)
+        xgb_model = CalibratedClassifierCV(base_xgb, method='sigmoid', cv=3)
+        rf_model = CalibratedClassifierCV(base_rf, method='sigmoid', cv=3)
 
         xgb_model.fit(X_train, y_train)
         rf_model.fit(X_train, y_train)
@@ -417,12 +462,14 @@ def get_short_term_forecast(req: ShortTermRequest):
         current_price = float(df['Close'].iloc[-1])
         current_atr = float(df['atr'].iloc[-1])
         
-        # 6. TRANSACTION COSTS & SIGNAL LOGIC
+        # 6. TRANSACTION COSTS, NEWS & SIGNAL LOGIC
         SPREAD_PIPS = 0.00015 
         signal = "HOLD"
         expected_move = current_atr * 1.5 
         
-        if p_up > 0.60 and macro_dev >= -0.03 and expected_move > SPREAD_PIPS:
+        if event_risk == "HIGH":
+            signal = "HOLD" # Override if major news is coming
+        elif p_up > 0.60 and macro_dev >= -0.03 and expected_move > SPREAD_PIPS:
             signal = "BUY"
             if df['net_sweep'].iloc[-1] == -1: signal = "HOLD"
         elif p_up < 0.40 and macro_dev <= 0.03 and expected_move > SPREAD_PIPS:
@@ -438,9 +485,9 @@ def get_short_term_forecast(req: ShortTermRequest):
         elif signal == "SELL":
             kelly_fraction = ((1 - p_up) - (p_up / risk_reward_ratio))
             
-        kelly_fraction = max(0.0, min(kelly_fraction, 0.05)) # Cap max risk at 5%
+        kelly_fraction = max(0.0, min(kelly_fraction, 0.05))
 
-        # 8. ATR RISK MANAGEMENT
+        # 8. ATR RISK MANAGEMENT (Fixed HOLD targets)
         if signal == "BUY":
             target_price = current_price + (3.0 * current_atr) 
             stop_loss = current_price - (1.5 * current_atr)
@@ -448,23 +495,30 @@ def get_short_term_forecast(req: ShortTermRequest):
             target_price = current_price - (3.0 * current_atr)
             stop_loss = current_price + (1.5 * current_atr)
         else:
-            target_price = current_price
-            stop_loss = current_price
+            # Show ATR band even on HOLD to prevent UI bug
+            target_price = current_price + (1.5 * current_atr)
+            stop_loss = current_price - (1.5 * current_atr)
+
+        # Format history for mini-chart
+        history = [{"date": d.strftime("%Y-%m-%d %H:%M:%S"), "price": float(r['Close'])} for d, r in df.tail(48).iterrows()]
 
         return {
             "status": "success",
             "data": {
                 "current_price": current_price,
                 "forecast_days": req.forecast_days,
-                "probability_up": p_up,
+                "probability_up": float(p_up),
                 "signal": signal,
                 "target_price": float(target_price),
                 "stop_loss": float(stop_loss),
                 "last_rsi": float(df['rsi'].iloc[-1]),
                 "macro_bias": "Bullish" if macro_dev > 0 else "Bearish",
                 "whale_trap_detected": bool(df['net_sweep'].iloc[-1] != 0),
+                "event_risk": event_risk,
+                "dxy_correlation": float(df['dxy_corr'].iloc[-1]) if 'dxy_corr' in df.columns else 0.0,
                 "recommended_position_size_pct": float(kelly_fraction * 100),
-                "model_weights": {"xgb": float(xgb_weight), "rf": float(rf_weight)}
+                "model_weights": {"xgb": float(xgb_weight), "rf": float(rf_weight)},
+                "history": history
             }
         }
     except Exception as e:

@@ -440,4 +440,4 @@ def get_short_term_forecast(req: ShortTermRequest):
         }
     except Exception as e:
         logger.error(f"Micro Forecast Error: {str(e)}")
-        raise HTTPException(status_code=500, detail={"status": "error", "message": str(e)})
+        raise HTTPException(status_code=500, detail={"status": "error", "message": str(e)}) 

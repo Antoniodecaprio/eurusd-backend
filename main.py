@@ -14,6 +14,7 @@ import requests
 import warnings
 import datetime
 import logging
+import csv
 from statsmodels.tsa.stattools import adfuller
 from functools import lru_cache
 
@@ -21,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 warnings.filterwarnings('ignore')
 
-app = FastAPI(title="EUR/USD Quant Forecaster", version="3.2.0")
+app = FastAPI(title="EUR/USD Quant Forecaster", version="3.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,6 +34,8 @@ app.add_middleware(
 
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
+
+JOURNAL_FILE = "forecast_journal.csv"
 
 class ForecastRequest(BaseModel):
     horizon_years: float = Field(default=3.0, gt=0.0, le=10.0)
@@ -81,7 +84,6 @@ def get_macro_state(df):
     except:
         adf_p = 1.0
 
-    # CORRECTION 2: Fit GMM to AR(1) residuals, not raw returns
     df_ols['residuals'] = df_ols['q'] - (intercept + slope * df_ols['q_lag'])
     
     gmm = GaussianMixture(n_components=2, random_state=42)
@@ -90,10 +92,6 @@ def get_macro_state(df):
     
     regimes = gmm.predict(valid_resids.values.reshape(-1, 1))
     current_regime = int(regimes[-1])
-    
-    # Identify which component has higher variance (regardless of label 0 or 1)
-    variances = gmm.covariances_.flatten()
-    high_var_idx = int(np.argmax(variances))
     
     if 0.0 < slope < 1.0 and adf_p < 0.05:
         phi = slope
@@ -122,7 +120,6 @@ def calculate_atr(df, window=14):
     return true_range.rolling(window=window).mean()
 
 def calculate_wilder_rsi(series, period=14):
-    """CORRECTION 7: Classic Wilder RSI with SMA seed"""
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -1 * delta.clip(upper=0)
@@ -141,12 +138,23 @@ def calculate_wilder_rsi(series, period=14):
     rs = avg_gain / np.where(avg_loss == 0, np.nan, avg_loss)
     rsi = 100 - (100 / (1 + rs))
     
-    # Handle edge cases
     rsi = np.where((avg_loss == 0) & (avg_gain > 0), 100, rsi)
     rsi = np.where((avg_gain == 0) & (avg_loss > 0), 0, rsi)
     rsi = np.where((avg_gain == 0) & (avg_loss == 0), 50, rsi)
     
     return pd.Series(rsi, index=series.index)
+
+def log_forecast_to_csv(record):
+    """Lightweight Forecast Journal"""
+    file_exists = os.path.isfile(JOURNAL_FILE)
+    try:
+        with open(JOURNAL_FILE, mode='a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=record.keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(record)
+    except Exception as e:
+        logger.error(f"Failed to write to journal: {e}")
 
 # ==========================================
 # MACRO ENDPOINT
@@ -154,13 +162,12 @@ def calculate_wilder_rsi(series, period=14):
 
 @app.get("/")
 def read_root():
-    return {"status": "API is running - Quant v3.2"}
+    return {"status": "API is running - Quant v3.3"}
 
 @app.post("/forecast")
 def get_forecast(req: ForecastRequest):
     try:
         cache_key = datetime.datetime.now().strftime("%Y-%m-%d-%H")
-        # CORRECTION 8: Return a copy to avoid shared mutable state
         df = fetch_macro_data_cached(cache_key).copy()
         current_spot = float(df['spot'].iloc[-1])
         
@@ -226,19 +233,16 @@ def get_forecast(req: ForecastRequest):
 @app.post("/short_term_forecast")
 def get_short_term_forecast(req: ShortTermRequest):
     try:
-        # CORRECTION 1: Only assign macro bias if mean-reverting
+        # 1. Macro State
         try:
             cache_key = datetime.datetime.now().strftime("%Y-%m-%d-%H")
             df_macro = fetch_macro_data_cached(cache_key).copy()
             macro_dev, _, _, _, macro_model, _ = get_macro_state(df_macro)
-            if macro_model == "AR(1)_mean_reverting":
-                macro_bias = "Bearish" if macro_dev > 0 else "Bullish"
-            else:
-                macro_bias = "Unavailable"
+            macro_bias = "Bearish" if (macro_dev > 0 and macro_model == "AR(1)_mean_reverting") else "Bullish" if (macro_dev < 0 and macro_model == "AR(1)_mean_reverting") else "Unavailable"
         except Exception:
             macro_dev, macro_bias = 0.0, "Unavailable"
 
-        # CORRECTION 9: Safely parse event calendar
+        # 2. Event Risk
         event_risk = "UNKNOWN"
         if TWELVE_DATA_KEY:
             try:
@@ -259,6 +263,7 @@ def get_short_term_forecast(req: ShortTermRequest):
             except Exception:
                 pass
 
+        # 3. Data Fetching
         df_eur = pd.DataFrame()
         df_dxy = pd.DataFrame()
         
@@ -305,7 +310,30 @@ def get_short_term_forecast(req: ShortTermRequest):
             df['Close_DXY'] = np.nan
 
         df['Close'] = df['Close_EUR']
+        current_price = float(df['Close'].iloc[-1])
+
+        # PHASE 1.5: Frankfurter Data Check (No API key needed)
+        data_discrepancy = False
+        try:
+            frank_res = requests.get("https://api.frankfurter.app/latest?from=EUR&to=USD", timeout=3).json()
+            frank_rate = float(frank_res['rates']['USD'])
+            if abs(frank_rate - current_price) / current_price > 0.01: # > 1% difference
+                data_discrepancy = True
+        except Exception:
+            frank_rate = None
+
+        # PHASE 1.5: Multi-Timeframe Alignment
+        df_h4 = df['Close'].resample('4h').last().dropna()
+        df_d1 = df['Close'].resample('1D').last().dropna()
         
+        h4_trend = "Up" if df_h4.iloc[-1] > df_h4.rolling(20).mean().iloc[-1] else "Down"
+        d1_trend = "Up" if df_d1.iloc[-1] > df_d1.rolling(10).mean().iloc[-1] else "Down"
+        
+        mtf_alignment = "Conflict"
+        if h4_trend == "Up" and d1_trend == "Up": mtf_alignment = "Strong Bullish"
+        elif h4_trend == "Down" and d1_trend == "Down": mtf_alignment = "Strong Bearish"
+
+        # Feature Engineering
         df['Clean_Close'] = df['Close'].ewm(span=10, adjust=False).mean()
         df['ret_1h'] = df['Clean_Close'].pct_change(1)
         df['ret_24h'] = df['Clean_Close'].pct_change(24)
@@ -324,7 +352,6 @@ def get_short_term_forecast(req: ShortTermRequest):
         df['std_50'] = df['Clean_Close'].rolling(window=50).std()
         df['z_score'] = (df['Clean_Close'] - df['sma_50']) / (df['std_50'] + 1e-9)
         
-        # CORRECTION 7: Wilder RSI on RAW Close, not Clean_Close
         df['rsi'] = calculate_wilder_rsi(df['Close'], period=14)
         df['rsi_extreme_low'] = (df['rsi'] <= 5).astype(int)
         df['rsi_extreme_high'] = (df['rsi'] >= 95).astype(int)
@@ -353,22 +380,19 @@ def get_short_term_forecast(req: ShortTermRequest):
             np.nan
         )
         
-        # CORRECTION 3 & 4: Remove macro_dev, dynamically handle DXY features
         features = ['ret_1h', 'ret_24h', 'dist_sma', 'rsi', 'rsi_extreme_low', 'rsi_extreme_high', 
                     'range_spike', 'net_sweep', 'near_swing_high', 'near_swing_low', 'trend_direction', 'z_score']
         
         if dxy_available:
             features.extend(['dxy_ret_1h', 'dxy_corr'])
         
-        # CORRECTION 5: No shift(1). Use data at time T to predict Target at T+periods_ahead.
-        df_live = df.iloc[:-1].copy() # Drop final possibly incomplete candle
+        df_live = df.iloc[:-1].copy() 
         X_live = df_live[features].iloc[-1:].copy()
         df_train = df.dropna(subset=features + ['target']).copy()
         
         if len(df_train) < 150:
             raise ValueError("Not enough clean data to train model")
 
-        # CORRECTION 6: Timestamp-based purging
         split_idx = int(len(df_train) * 0.75)
         purge_time = df_train.index[split_idx] - pd.Timedelta(hours=periods_ahead)
         train_df = df_train[df_train.index <= purge_time]
@@ -386,7 +410,6 @@ def get_short_term_forecast(req: ShortTermRequest):
         p_up_pure = (p_up_xgb * 0.5) + (p_up_rf * 0.5)
         model_disagreement = float(abs(p_up_xgb - p_up_rf))
 
-        current_price = float(df['Close'].iloc[-1])
         current_atr = float(df['atr'].iloc[-1])
         current_rsi = float(df['rsi'].iloc[-1])
         current_trend = int(df['trend_direction'].iloc[-1])
@@ -402,7 +425,6 @@ def get_short_term_forecast(req: ShortTermRequest):
         SPREAD_PIPS = 0.00015 
         expected_move = current_atr * 1.5 
         
-        # CORRECTION 10: Keep raw signal separate
         raw_signal = "HOLD"
         if event_risk in ["HIGH", "UNKNOWN"]:
             raw_signal = "HOLD" 
@@ -431,8 +453,6 @@ def get_short_term_forecast(req: ShortTermRequest):
             if current_z > 2.5: signal = "HOLD" 
             if current_rsi > 85 and current_z < 1.5: signal = "HOLD" 
 
-        kelly_fraction = 0.0
-
         if signal == "BUY":
             target_price = current_price + (3.0 * current_atr) 
             stop_loss = current_price - (1.5 * current_atr)
@@ -445,7 +465,18 @@ def get_short_term_forecast(req: ShortTermRequest):
 
         history = [{"date": d.strftime("%Y-%m-%d %H:%M:%S"), "price": float(r['Close'])} for d, r in df.tail(48).iterrows()]
 
-        # CORRECTION 11: FlutterFlow Compatibility restored
+        # PHASE 1.5: Log to Journal
+        journal_record = {
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "spot": current_price,
+            "prob_up": round(p_up_pure, 4),
+            "signal": signal,
+            "target": round(target_price, 5),
+            "stop": round(stop_loss, 5),
+            "mtf_trend": mtf_alignment
+        }
+        log_forecast_to_csv(journal_record)
+
         return {
             "status": "success",
             "data": {
@@ -459,22 +490,36 @@ def get_short_term_forecast(req: ShortTermRequest):
                 "signal": signal,
                 "raw_signal": raw_signal,
                 "horizon_conflict": horizon_conflict,
+                "mtf_trend": mtf_alignment,
+                "data_discrepancy": data_discrepancy,
                 "target_price": float(target_price),
                 "stop_loss": float(stop_loss),
                 "last_rsi": float(current_rsi),
                 "macro_bias": macro_bias,
-                "whale_trap_detected": bool(df['net_sweep'].iloc[-1] != 0), # Restored
-                "sweep_detected": bool(df['net_sweep'].iloc[-1] != 0),      # New
+                "whale_trap_detected": bool(df['net_sweep'].iloc[-1] != 0),
                 "event_risk": event_risk,
                 "dxy_available": dxy_available,
-                "dxy_correlation": float(df['dxy_corr'].iloc[-1]) if dxy_available else 0.0, # Restored
+                "dxy_correlation": float(df['dxy_corr'].iloc[-1]) if dxy_available else 0.0,
                 "trend_direction": "Up" if current_trend == 1 else "Down",
                 "reversal_expectation_hours": reversal_hours,
                 "recommended_position_size_pct": 0.0,
-                "model_weights": {"xgb": 0.5, "rf": 0.5}, # Restored
+                "model_weights": {"xgb": 0.5, "rf": 0.5},
                 "history": history
             }
         }
     except Exception as e:
         logger.error(f"Micro Forecast Error: {str(e)}")
         raise HTTPException(status_code=500, detail={"status": "error", "message": str(e)})
+
+@app.get("/journal")
+def get_journal():
+    """Read the last 20 forecasts"""
+    if not os.path.isfile(JOURNAL_FILE):
+        return {"status": "success", "journal": []}
+    try:
+        with open(JOURNAL_FILE, mode='r') as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            return {"status": "success", "journal": rows[-20:]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

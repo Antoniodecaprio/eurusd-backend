@@ -9,4 +9,4 @@ fredapi>=0.5.2,<1.0
 yfinance>=0.2.40,<2.0
 xgboost>=2.0,<4.0
 requests>=2.31,<3.0
-statsmodels>=0.14,<1.0
+statsmodels>=0.14,<1.0 

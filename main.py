@@ -17,18 +17,15 @@ import logging
 from statsmodels.tsa.stattools import adfuller
 from functools import lru_cache
 
-# Setup strict logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 warnings.filterwarnings('ignore')
 
-app = FastAPI(title="EUR/USD Quant Forecaster", version="3.0.0")
+app = FastAPI(title="EUR/USD Quant Forecaster", version="3.2.0")
 
-# Fixed CORS: Removed wildcard credentials leak
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Restrict this to your FlutterFlow domain in production
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,7 +48,6 @@ class ShortTermRequest(BaseModel):
 
 @lru_cache(maxsize=1)
 def fetch_macro_data_cached(cache_buster: str):
-    """Caches FRED data to prevent Render timeouts. Cache updates every 12 hours."""
     if not FRED_API_KEY:
         raise ValueError("FRED_API_KEY not set")
     fred = Fred(api_key=FRED_API_KEY)
@@ -76,7 +72,7 @@ def fetch_macro_data_cached(cache_buster: str):
 
 def get_macro_state(df):
     df['q_lag'] = df['q'].shift(1)
-    df_ols = df.dropna()
+    df_ols = df.dropna().copy()
     
     slope, intercept, _, _, _ = linregress(df_ols['q_lag'], df_ols['q'])
     
@@ -85,12 +81,19 @@ def get_macro_state(df):
     except:
         adf_p = 1.0
 
-    df['q_ret'] = df['q'].diff()
+    # CORRECTION 2: Fit GMM to AR(1) residuals, not raw returns
+    df_ols['residuals'] = df_ols['q'] - (intercept + slope * df_ols['q_lag'])
+    
     gmm = GaussianMixture(n_components=2, random_state=42)
-    valid_returns = df['q_ret'].dropna()
-    gmm.fit(valid_returns.values.reshape(-1, 1))
-    regimes = gmm.predict(valid_returns.values.reshape(-1, 1))
+    valid_resids = df_ols['residuals'].dropna()
+    gmm.fit(valid_resids.values.reshape(-1, 1))
+    
+    regimes = gmm.predict(valid_resids.values.reshape(-1, 1))
     current_regime = int(regimes[-1])
+    
+    # Identify which component has higher variance (regardless of label 0 or 1)
+    variances = gmm.covariances_.flatten()
+    high_var_idx = int(np.argmax(variances))
     
     if 0.0 < slope < 1.0 and adf_p < 0.05:
         phi = slope
@@ -98,20 +101,14 @@ def get_macro_state(df):
         deviation = df['q'].iloc[-1] - q_bar
         model_type = "AR(1)_mean_reverting"
         
-        # REVIEWER FIX: AR(1) Innovation Variance
-        df_ols['residuals'] = df_ols['q'] - (intercept + phi * df_ols['q_lag'])
         df_ols['regime'] = regimes
         current_resids = df_ols[df_ols['regime'] == current_regime]['residuals']
-        # Fallback to global residual variance if regime sample is too small
         sigma_eps = current_resids.std() if len(current_resids) > 10 else df_ols['residuals'].std()
-        
     else:
         phi = 1.0
         q_bar = None
         deviation = 0.0
         model_type = "random_walk_fallback"
-        drift = df['q'].diff().mean()
-        # RW variance (annualized)
         sigma_eps = df['q'].diff().std() * np.sqrt(12)
         
     return deviation, current_regime, phi, q_bar, model_type, sigma_eps
@@ -124,38 +121,62 @@ def calculate_atr(df, window=14):
     true_range = np.max(ranges, axis=1)
     return true_range.rolling(window=window).mean()
 
+def calculate_wilder_rsi(series, period=14):
+    """CORRECTION 7: Classic Wilder RSI with SMA seed"""
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -1 * delta.clip(upper=0)
+    
+    avg_gain = np.full(len(series), np.nan)
+    avg_loss = np.full(len(series), np.nan)
+    
+    if len(series) > period:
+        avg_gain[period] = gain.iloc[1:period+1].mean()
+        avg_loss[period] = loss.iloc[1:period+1].mean()
+        
+        for i in range(period + 1, len(series)):
+            avg_gain[i] = ((avg_gain[i-1] * (period - 1)) + gain.iloc[i]) / period
+            avg_loss[i] = ((avg_loss[i-1] * (period - 1)) + loss.iloc[i]) / period
+            
+    rs = avg_gain / np.where(avg_loss == 0, np.nan, avg_loss)
+    rsi = 100 - (100 / (1 + rs))
+    
+    # Handle edge cases
+    rsi = np.where((avg_loss == 0) & (avg_gain > 0), 100, rsi)
+    rsi = np.where((avg_gain == 0) & (avg_loss > 0), 0, rsi)
+    rsi = np.where((avg_gain == 0) & (avg_loss == 0), 50, rsi)
+    
+    return pd.Series(rsi, index=series.index)
+
 # ==========================================
 # MACRO ENDPOINT
 # ==========================================
 
 @app.get("/")
 def read_root():
-    return {"status": "API is running - Quant v3.0"}
+    return {"status": "API is running - Quant v3.2"}
 
 @app.post("/forecast")
 def get_forecast(req: ForecastRequest):
     try:
-        # 12-hour cache buster
         cache_key = datetime.datetime.now().strftime("%Y-%m-%d-%H")
-        df = fetch_macro_data_cached(cache_key)
+        # CORRECTION 8: Return a copy to avoid shared mutable state
+        df = fetch_macro_data_cached(cache_key).copy()
         current_spot = float(df['spot'].iloc[-1])
         
         deviation, current_regime, phi, q_bar, model_type, sigma_eps = get_macro_state(df)
         
         if model_type == "AR(1)_mean_reverting":
             current_q = np.log(current_spot) + df['p_us'].iloc[-1] - df['p_ez'].iloc[-1]
-            half_life = np.log(0.5) / np.log(phi) / 12 # in years
+            half_life = np.log(0.5) / np.log(phi) / 12
             phi_n = phi ** (req.horizon_years * 12)
             drift_q = (phi_n - 1) * (current_q - q_bar)
             ppp_anchor = float(np.exp(q_bar - df['p_us'].iloc[-1] + df['p_ez'].iloc[-1]))
-            
-            # REVIEWER FIX: Finite Geometric Sum for AR(1) Variance
             var_q = (sigma_eps ** 2) * (1 - phi ** (2 * req.horizon_years * 12)) / (1 - phi ** 2)
         else:
             half_life = None
             drift_q = df['q'].diff().mean() * (req.horizon_years * 12)
             ppp_anchor = None
-            # Random Walk variance
             var_q = (sigma_eps ** 2) * req.horizon_years
 
         drift_infl = (req.pi_ez - req.pi_us) * req.horizon_years
@@ -164,13 +185,11 @@ def get_forecast(req: ForecastRequest):
         
         p_up = norm.cdf(mean_delta / std_delta) if std_delta > 0 else 0.5
         
-        # REVIEWER FIX: Median vs Expected Value in Lognormal Distribution
         median_rate = float(np.exp(np.log(current_spot) + mean_delta))
         expected_rate = float(np.exp(np.log(current_spot) + mean_delta + (var_q / 2)))
         
         historical_data = [{"date": d.strftime("%Y-%m-%d"), "price": float(r['spot'])} for d, r in df.tail(60).iterrows()]
         
-        # REVIEWER FIX: Corrected Macro Bias Direction (Positive dev = Overvalued EUR = Bearish)
         macro_bias = "Neutral"
         if model_type == "AR(1)_mean_reverting":
             macro_bias = "Bearish" if deviation > 0 else "Bullish"
@@ -207,15 +226,19 @@ def get_forecast(req: ForecastRequest):
 @app.post("/short_term_forecast")
 def get_short_term_forecast(req: ShortTermRequest):
     try:
-        # 1. Macro State
+        # CORRECTION 1: Only assign macro bias if mean-reverting
         try:
             cache_key = datetime.datetime.now().strftime("%Y-%m-%d-%H")
-            df_macro = fetch_macro_data_cached(cache_key)
-            macro_dev, _, _, _, _, _ = get_macro_state(df_macro)
+            df_macro = fetch_macro_data_cached(cache_key).copy()
+            macro_dev, _, _, _, macro_model, _ = get_macro_state(df_macro)
+            if macro_model == "AR(1)_mean_reverting":
+                macro_bias = "Bearish" if macro_dev > 0 else "Bullish"
+            else:
+                macro_bias = "Unavailable"
         except Exception:
-            macro_dev = 0.0
+            macro_dev, macro_bias = 0.0, "Unavailable"
 
-        # 2. Economic Calendar Check (Fails to UNKNOWN, not LOW)
+        # CORRECTION 9: Safely parse event calendar
         event_risk = "UNKNOWN"
         if TWELVE_DATA_KEY:
             try:
@@ -225,15 +248,17 @@ def get_short_term_forecast(req: ShortTermRequest):
                     event_risk = "LOW"
                     now = datetime.datetime.now(datetime.timezone.utc)
                     for event in cal_res['data']:
-                        # Only flag events within the forecast window
-                        event_time = pd.to_datetime(event.get('date')).tz_localize('UTC')
-                        if event.get('impact') == 'High' and now <= event_time <= now + datetime.timedelta(days=req.forecast_days):
-                            event_risk = "HIGH"
-                            break
+                        raw_time = event.get('date')
+                        if raw_time:
+                            event_time = pd.to_datetime(raw_time)
+                            if event_time.tzinfo is None:
+                                event_time = event_time.tz_localize('UTC')
+                            if event.get('impact') == 'High' and now <= event_time <= now + datetime.timedelta(days=req.forecast_days):
+                                event_risk = "HIGH"
+                                break
             except Exception:
-                pass # Remains UNKNOWN
+                pass
 
-        # 3. Data Fetching
         df_eur = pd.DataFrame()
         df_dxy = pd.DataFrame()
         
@@ -266,7 +291,6 @@ def get_short_term_forecast(req: ShortTermRequest):
         if df_eur.empty or len(df_eur) < 100:
             raise ValueError("Data unavailable for EUR")
 
-        # REVIEWER FIX: Do not fabricate DXY. Exclude if missing.
         dxy_available = not df_dxy.empty
         
         df_eur = df_eur[['Open', 'High', 'Low', 'Close']].rename(columns={'Close': 'Close_EUR'})
@@ -282,7 +306,6 @@ def get_short_term_forecast(req: ShortTermRequest):
 
         df['Close'] = df['Close_EUR']
         
-        # 4. Feature Engineering (Removed fabricated volume)
         df['Clean_Close'] = df['Close'].ewm(span=10, adjust=False).mean()
         df['ret_1h'] = df['Clean_Close'].pct_change(1)
         df['ret_24h'] = df['Clean_Close'].pct_change(24)
@@ -301,15 +324,12 @@ def get_short_term_forecast(req: ShortTermRequest):
         df['std_50'] = df['Clean_Close'].rolling(window=50).std()
         df['z_score'] = (df['Clean_Close'] - df['sma_50']) / (df['std_50'] + 1e-9)
         
-        delta = df['Clean_Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / (loss + 1e-9) 
-        df['rsi'] = 100 - (100 / (1 + rs))
-        
+        # CORRECTION 7: Wilder RSI on RAW Close, not Clean_Close
+        df['rsi'] = calculate_wilder_rsi(df['Close'], period=14)
+        df['rsi_extreme_low'] = (df['rsi'] <= 5).astype(int)
+        df['rsi_extreme_high'] = (df['rsi'] >= 95).astype(int)
+
         df['atr'] = calculate_atr(df, window=14)
-        
-        # REVIEWER FIX: Rename "Whale" to actual metric (Range Expansion)
         df['range_size'] = df['High'] - df['Low']
         df['range_mean'] = df['range_size'].rolling(window=24).mean()
         df['range_spike'] = np.where(df['range_size'] > (df['range_mean'] * 1.5), 1, 0)
@@ -326,9 +346,6 @@ def get_short_term_forecast(req: ShortTermRequest):
         df['near_swing_high'] = np.where(df['Close'] > df['swing_high'] * 0.998, 1, 0)
         df['near_swing_low'] = np.where(df['Close'] < df['swing_low'] * 1.002, 1, 0)
 
-        df['macro_dev'] = macro_dev
-
-        # REVIEWER FIX: Target Construction (Preserve NaNs)
         periods_ahead = req.forecast_days * 24 
         df['target'] = np.where(
             df['Close'].shift(-periods_ahead).notna(),
@@ -336,33 +353,38 @@ def get_short_term_forecast(req: ShortTermRequest):
             np.nan
         )
         
-        features = ['ret_1h', 'dxy_ret_1h', 'dxy_corr', 'ret_24h', 'dist_sma', 'rsi', 'range_spike', 'net_sweep', 
-                    'macro_dev', 'near_swing_high', 'near_swing_low', 'trend_direction', 'z_score']
+        # CORRECTION 3 & 4: Remove macro_dev, dynamically handle DXY features
+        features = ['ret_1h', 'ret_24h', 'dist_sma', 'rsi', 'rsi_extreme_low', 'rsi_extreme_high', 
+                    'range_spike', 'net_sweep', 'near_swing_high', 'near_swing_low', 'trend_direction', 'z_score']
         
-        # Shift features to predict the NEXT candle
-        df[features] = df[features].shift(1) 
+        if dxy_available:
+            features.extend(['dxy_ret_1h', 'dxy_corr'])
         
-        # Split LIVE data (unlabelled) from TRAIN data (labelled)
-        X_live = df[features].iloc[-1:].copy()
+        # CORRECTION 5: No shift(1). Use data at time T to predict Target at T+periods_ahead.
+        df_live = df.iloc[:-1].copy() # Drop final possibly incomplete candle
+        X_live = df_live[features].iloc[-1:].copy()
         df_train = df.dropna(subset=features + ['target']).copy()
         
         if len(df_train) < 150:
             raise ValueError("Not enough clean data to train model")
 
-        # REVIEWER FIX: Purged Split
+        # CORRECTION 6: Timestamp-based purging
         split_idx = int(len(df_train) * 0.75)
-        train_df = df_train.iloc[:split_idx - periods_ahead] 
+        purge_time = df_train.index[split_idx] - pd.Timedelta(hours=periods_ahead)
+        train_df = df_train[df_train.index <= purge_time]
         
+        target_up_rate = float(train_df['target'].mean())
+
         base_xgb = xgb.XGBClassifier(n_estimators=50, learning_rate=0.05, max_depth=3, objective='binary:logistic', eval_metric='logloss')
         base_rf = RandomForestClassifier(n_estimators=50, max_depth=4, random_state=42)
 
         base_xgb.fit(train_df[features], train_df['target'])
         base_rf.fit(train_df[features], train_df['target'])
 
-        # 6. Prediction
-        xgb_weight = 0.5
-        rf_weight = 0.5
-        p_up_pure = (base_xgb.predict_proba(X_live)[0][1] * xgb_weight) + (base_rf.predict_proba(X_live)[0][1] * rf_weight)
+        p_up_xgb = float(base_xgb.predict_proba(X_live)[0][1])
+        p_up_rf = float(base_rf.predict_proba(X_live)[0][1])
+        p_up_pure = (p_up_xgb * 0.5) + (p_up_rf * 0.5)
+        model_disagreement = float(abs(p_up_xgb - p_up_rf))
 
         current_price = float(df['Close'].iloc[-1])
         current_atr = float(df['atr'].iloc[-1])
@@ -377,35 +399,39 @@ def get_short_term_forecast(req: ShortTermRequest):
         phi_z = float(np.clip(slope_z, 0.01, 0.999))
         reversal_hours = float(np.log(0.5) / np.log(phi_z))
         
-        # 7. Signal Logic
         SPREAD_PIPS = 0.00015 
         expected_move = current_atr * 1.5 
         
-        rsi_low_bound = max(df['rsi'].tail(500).quantile(0.05), 25.0)
-        rsi_high_bound = min(df['rsi'].tail(500).quantile(0.95), 75.0)
-        
-        signal = "HOLD"
-        
-        # REVIEWER FIX: Macro direction aligned with q formula. High q = Overvalued = SELL bias.
+        # CORRECTION 10: Keep raw signal separate
+        raw_signal = "HOLD"
         if event_risk in ["HIGH", "UNKNOWN"]:
-            signal = "HOLD" # Block signals if event risk is unsafe or unknown
+            raw_signal = "HOLD" 
         elif p_up_pure > 0.60 and macro_dev <= 0.03 and expected_move > SPREAD_PIPS:
-            signal = "BUY"
-            if df['net_sweep'].iloc[-1] == -1: signal = "HOLD"
+            raw_signal = "BUY"
+            if df['net_sweep'].iloc[-1] == -1: raw_signal = "HOLD"
         elif p_up_pure < 0.40 and macro_dev >= -0.03 and expected_move > SPREAD_PIPS:
-            signal = "SELL"
-            if df['net_sweep'].iloc[-1] == 1: signal = "HOLD"
+            raw_signal = "SELL"
+            if df['net_sweep'].iloc[-1] == 1: raw_signal = "HOLD"
 
-        # Vetoes
-        if signal == "SELL" and current_trend == 1: signal = "HOLD" 
-        if signal == "BUY" and current_trend == -1: signal = "HOLD" 
-        if signal == "SELL" and current_z < -2.0: signal = "HOLD" 
-        if signal == "BUY" and current_z > 2.0: signal = "HOLD" 
-        if signal == "BUY" and current_rsi > 75: signal = "HOLD"
-        if signal == "SELL" and current_rsi < 25: signal = "HOLD"
+        signal = raw_signal
+        
+        horizon_conflict = "Aligned"
+        if macro_bias != "Unavailable":
+            if (macro_bias == "Bullish" and raw_signal == "SELL") or (macro_bias == "Bearish" and raw_signal == "BUY"):
+                horizon_conflict = "Conflicting Horizons"
+            elif macro_bias == "Neutral":
+                horizon_conflict = "Macro Neutral"
 
-        # 8. REVIEWER FIX: Kelly Sizing Disabled
-        kelly_fraction = 0.0 # Safely disabled per review
+        if signal == "SELL":
+            if current_trend == 1: signal = "HOLD" 
+            if current_z < -2.5: signal = "HOLD" 
+            if current_rsi < 15 and current_z > -1.5: signal = "HOLD" 
+        elif signal == "BUY":
+            if current_trend == -1: signal = "HOLD" 
+            if current_z > 2.5: signal = "HOLD" 
+            if current_rsi > 85 and current_z < 1.5: signal = "HOLD" 
+
+        kelly_fraction = 0.0
 
         if signal == "BUY":
             target_price = current_price + (3.0 * current_atr) 
@@ -419,25 +445,36 @@ def get_short_term_forecast(req: ShortTermRequest):
 
         history = [{"date": d.strftime("%Y-%m-%d %H:%M:%S"), "price": float(r['Close'])} for d, r in df.tail(48).iterrows()]
 
+        # CORRECTION 11: FlutterFlow Compatibility restored
         return {
             "status": "success",
             "data": {
                 "current_price": current_price,
+                "forecast_days": req.forecast_days,
                 "probability_up": float(p_up_pure),
+                "xgb_probability": p_up_xgb,
+                "rf_probability": p_up_rf,
+                "model_disagreement": model_disagreement,
+                "target_up_rate": target_up_rate,
                 "signal": signal,
+                "raw_signal": raw_signal,
+                "horizon_conflict": horizon_conflict,
                 "target_price": float(target_price),
                 "stop_loss": float(stop_loss),
                 "last_rsi": float(current_rsi),
-                "macro_bias": "Bearish" if macro_dev > 0 else "Bullish", # Corrected mapping
-                "sweep_detected": bool(df['net_sweep'].iloc[-1] != 0), # Renamed
+                "macro_bias": macro_bias,
+                "whale_trap_detected": bool(df['net_sweep'].iloc[-1] != 0), # Restored
+                "sweep_detected": bool(df['net_sweep'].iloc[-1] != 0),      # New
                 "event_risk": event_risk,
-                "dxy_available": dxy_available, # Added flag for UI
+                "dxy_available": dxy_available,
+                "dxy_correlation": float(df['dxy_corr'].iloc[-1]) if dxy_available else 0.0, # Restored
                 "trend_direction": "Up" if current_trend == 1 else "Down",
                 "reversal_expectation_hours": reversal_hours,
-                "recommended_position_size_pct": 0.0, # Hardcoded to 0
+                "recommended_position_size_pct": 0.0,
+                "model_weights": {"xgb": 0.5, "rf": 0.5}, # Restored
                 "history": history
             }
         }
     except Exception as e:
         logger.error(f"Micro Forecast Error: {str(e)}")
-        raise HTTPException(status_code=500, detail={"status": "error", "message": str(e)}) 
+        raise HTTPException(status_code=500, detail={"status": "error", "message": str(e)})

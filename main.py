@@ -17,6 +17,7 @@ import warnings
 import datetime
 import logging
 import csv
+import json  # <-- NEW: For state management
 from statsmodels.tsa.stattools import adfuller
 from functools import lru_cache
 
@@ -24,7 +25,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 warnings.filterwarnings('ignore')
 
-app = FastAPI(title="EUR/USD Quant Forecaster", version="4.2.0")
+app = FastAPI(title="EUR/USD Quant Forecaster", version="4.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,8 +37,11 @@ app.add_middleware(
 
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") # <-- NEW
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")     # <-- NEW
 
 JOURNAL_FILE = "forecast_journal.csv"
+STATE_FILE = "last_signal_state.json"                # <-- NEW
 
 class ShortTermRequest(BaseModel):
     forecast_days: int = Field(default=3, ge=1, le=7)
@@ -52,11 +56,7 @@ class ForecastRequest(BaseModel):
 # ==========================================
 
 def adapt_for_flutter(data: dict) -> dict:
-    """
-    Adapter Pattern: Keeps internal math pure.
-    Converts None to 0.0 for FlutterFlow's strict Double typing, 
-    but adds explicit availability flags so we don't lie about the data.
-    """
+    """Converts None to 0.0 for FlutterFlow's strict typing."""
     safe_data = data.copy()
     numeric_keys = [
         'current_price', 'target_price', 'stop_loss', 'probability_up', 'xgb_probability', 
@@ -80,6 +80,35 @@ def adapt_for_flutter(data: dict) -> dict:
         safe_data['trend_direction'] = 'Unknown'
         
     return safe_data
+
+def get_last_signal():
+    """Reads the last known signal to prevent notification spam."""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r') as f:
+                return json.load(f).get("last_signal", "HOLD")
+        except Exception:
+            return "HOLD"
+    return "HOLD"
+
+def update_last_signal(signal):
+    """Saves the current signal."""
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump({"last_signal": signal}, f)
+    except Exception as e:
+        logger.error(f"Failed to save state: {e}")
+
+def send_telegram_alert(message: str):
+    """Sends a message to Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+        requests.post(url, json=payload, timeout=3)
+    except Exception as e:
+        logger.error(f"Telegram alert failed: {e}")
 
 @lru_cache(maxsize=1)
 def fetch_macro_data_cached(cache_buster: str):
@@ -245,7 +274,7 @@ def log_forecast_to_csv(record):
 
 @app.get("/")
 def read_root():
-    return {"status": "API is running - Quant v4.2"}
+    return {"status": "API is running - Quant v4.3"}
 
 @app.post("/forecast")
 def get_forecast(req: ForecastRequest):
@@ -351,7 +380,6 @@ def get_short_term_forecast(req: ShortTermRequest):
                             except Exception:
                                 continue
                     
-                    # FIXED: Calendar available is set AFTER checking all events
                     if valid_upcoming_events > 0:
                         calendar_available = True
                         if event_risk != "HIGH":
@@ -542,7 +570,7 @@ def get_short_term_forecast(req: ShortTermRequest):
         
         # FIXED: Strict ATR Guardrail
         if current_atr is None or not np.isfinite(current_atr) or current_atr <= 0:
-            fallback_tr = (df['High'] - df['Low']).tail(14).mean() # Fallback to simple range if TR fails
+            fallback_tr = (df['High'] - df['Low']).tail(14).mean() 
             if not np.isfinite(fallback_tr) or fallback_tr <= 0:
                 raise ValueError("Invalid ATR and fallback. Forecast aborted.")
             current_atr = fallback_tr
@@ -597,6 +625,32 @@ def get_short_term_forecast(req: ShortTermRequest):
         }
         log_forecast_to_csv(journal_record)
 
+        # --- NEW: TELEGRAM NOTIFICATION LOGIC ---
+        last_signal = get_last_signal()
+        
+        if signal != last_signal:
+            if signal in ["BUY", "SELL"]:
+                # Safely format numbers to avoid crashes
+                tp_str = f"{target_price:.5f}" if target_price is not None else "N/A"
+                sl_str = f"{stop_loss:.5f}" if stop_loss is not None else "N/A"
+                bss_str = f"{bss*100:.1f}%" if bss is not None else "N/A"
+                
+                alert_msg = (
+                    f"🚨 *NEW {signal} SIGNAL* 🚨\n\n"
+                    f"💵 *Asset:* EUR/USD\n"
+                    f"📍 *Entry Price:* {current_price:.5f}\n"
+                    f"🎯 *Target:* {tp_str}\n"
+                    f"🛑 *Stop Loss:* {sl_str}\n"
+                    f"📊 *Prob Up:* {p_up_pure*100:.1f}%\n"
+                    f"⚖️ *Brier Edge:* {bss_str}"
+                )
+                send_telegram_alert(alert_msg)
+            elif signal == "HOLD" and last_signal in ["BUY", "SELL"]:
+                send_telegram_alert(f"🔔 *Trade Closed / Signal Faded* 🔔\nEUR/USD is now back to HOLD.")
+            
+            update_last_signal(signal)
+        # ----------------------------------------
+
         raw_response = {
             "current_price": current_price,
             "forecast_days": req.forecast_days,
@@ -646,7 +700,6 @@ def get_short_term_forecast(req: ShortTermRequest):
 
     except Exception as e:
         logger.exception("Short-term forecast failed")
-        # Fallback response that is FlutterFlow safe, but honest
         fallback_response = {
             "current_price": 0.0, "forecast_days": req.forecast_days,
             "probability_up": 0.0, "xgb_probability": 0.0, "rf_probability": 0.0,

@@ -421,4 +421,4 @@ def get_short_term_forecast(req: ShortTermRequest):
             }
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) 

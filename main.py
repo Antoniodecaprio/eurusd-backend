@@ -1,12 +1,11 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import numpy as np
 import pandas as pd
 from fredapi import Fred
 from scipy.stats import norm, linregress
-from sklearn.mixture import GaussianMixture
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import brier_score_loss, accuracy_score
 import yfinance as yf
@@ -16,8 +15,6 @@ import requests
 import warnings
 import datetime
 import logging
-import csv
-import json  # <-- NEW: For state management
 from statsmodels.tsa.stattools import adfuller
 from functools import lru_cache
 
@@ -25,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 warnings.filterwarnings('ignore')
 
-app = FastAPI(title="EUR/USD Quant Forecaster", version="4.3.0")
+app = FastAPI(title="EUR/USD Quant Forecaster", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,13 +32,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ENV VARIABLES
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") # <-- NEW
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")     # <-- NEW
-
-JOURNAL_FILE = "forecast_journal.csv"
-STATE_FILE = "last_signal_state.json"                # <-- NEW
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 class ShortTermRequest(BaseModel):
     forecast_days: int = Field(default=3, ge=1, le=7)
@@ -52,11 +49,71 @@ class ForecastRequest(BaseModel):
     pi_ez: float = Field(default=0.02, ge=-0.05, le=0.25)
 
 # ==========================================
-# HELPER FUNCTIONS & ADAPTERS
+# SUPABASE & TELEGRAM HELPERS
+# ==========================================
+
+def get_supabase_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
+
+def get_last_signal_db():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return "HOLD", 0.0
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/signal_state?instrument=eq.EUR/USD"
+        res = requests.get(url, headers=get_supabase_headers(), timeout=5)
+        data = res.json()
+        if data and len(data) > 0:
+            last_alert = data[0].get("last_alert_at")
+            if last_alert:
+                # Convert ISO string to timestamp
+                last_alert_time = datetime.datetime.fromisoformat(last_alert.replace('Z', '+00:00')).timestamp()
+            else:
+                last_alert_time = 0.0
+            return data[0]["last_signal"], last_alert_time
+    except Exception as e:
+        logger.error(f"Supabase GET error: {e}")
+    return "HOLD", 0.0
+
+def update_last_signal_db(signal, timestamp):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/signal_state?instrument=eq.EUR/USD"
+        dt_str = datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc).isoformat()
+        payload = {"last_signal": signal, "last_alert_at": dt_str, "updated_at": "now()"}
+        requests.patch(url, headers=get_supabase_headers(), json=payload, timeout=5)
+    except Exception as e:
+        logger.error(f"Supabase PATCH error: {e}")
+
+def log_forecast_to_db(record):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/forecast_journal"
+        requests.post(url, headers=get_supabase_headers(), json=record, timeout=5)
+    except Exception as e:
+        logger.error(f"Supabase POST error: {e}")
+
+def send_telegram_alert(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+        requests.post(url, json=payload, timeout=3)
+    except Exception as e:
+        logger.error(f"Telegram alert failed: {e}")
+
+# ==========================================
+# ADAPTER & MATH HELPERS
 # ==========================================
 
 def adapt_for_flutter(data: dict) -> dict:
-    """Converts None to 0.0 for FlutterFlow's strict typing."""
     safe_data = data.copy()
     numeric_keys = [
         'current_price', 'target_price', 'stop_loss', 'probability_up', 'xgb_probability', 
@@ -78,42 +135,11 @@ def adapt_for_flutter(data: dict) -> dict:
                 
     if safe_data.get('trend_direction') not in ['Up', 'Down']:
         safe_data['trend_direction'] = 'Unknown'
-        
     return safe_data
-
-def get_last_signal():
-    """Reads the last known signal to prevent notification spam."""
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, 'r') as f:
-                return json.load(f).get("last_signal", "HOLD")
-        except Exception:
-            return "HOLD"
-    return "HOLD"
-
-def update_last_signal(signal):
-    """Saves the current signal."""
-    try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump({"last_signal": signal}, f)
-    except Exception as e:
-        logger.error(f"Failed to save state: {e}")
-
-def send_telegram_alert(message: str):
-    """Sends a message to Telegram."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-        requests.post(url, json=payload, timeout=3)
-    except Exception as e:
-        logger.error(f"Telegram alert failed: {e}")
 
 @lru_cache(maxsize=1)
 def fetch_macro_data_cached(cache_buster: str):
-    if not FRED_API_KEY:
-        raise ValueError("FRED_API_KEY not set")
+    if not FRED_API_KEY: raise ValueError("FRED_API_KEY not set")
     fred = Fred(api_key=FRED_API_KEY)
     def to_month_end(series):
         series = pd.Series(series).dropna()
@@ -136,34 +162,24 @@ def get_macro_state(df):
     df['q_lag'] = df['q'].shift(1)
     df_ols = df.dropna().copy()
     slope, intercept, _, _, _ = linregress(df_ols['q_lag'], df_ols['q'])
-    
-    try:
-        adf_p = adfuller(df['q'], regression="c", autolag="AIC")[1]
-    except:
-        adf_p = 1.0
+    try: adf_p = adfuller(df['q'], regression="c", autolag="AIC")[1]
+    except: adf_p = 1.0
 
     df_ols['residuals'] = df_ols['q'] - (intercept + slope * df_ols['q_lag'])
-    gmm = GaussianMixture(n_components=2, random_state=42)
-    valid_resids = df_ols['residuals'].dropna()
-    gmm.fit(valid_resids.values.reshape(-1, 1))
-    regimes = gmm.predict(valid_resids.values.reshape(-1, 1))
-    current_regime = int(regimes[-1])
     
     if 0.0 < slope < 1.0 and adf_p < 0.05:
         phi = slope
         q_bar = intercept / (1 - phi)
         deviation = df['q'].iloc[-1] - q_bar
         model_type = "AR(1)_mean_reverting"
-        df_ols['regime'] = regimes
-        current_resids = df_ols[df_ols['regime'] == current_regime]['residuals']
-        sigma_eps = current_resids.std() if len(current_resids) > 10 else df_ols['residuals'].std()
+        sigma_eps = df_ols['residuals'].std()
     else:
         phi = 1.0
         q_bar = None
         deviation = 0.0
         model_type = "random_walk_fallback"
         sigma_eps = df['q'].diff().std() * np.sqrt(12)
-    return deviation, current_regime, phi, q_bar, model_type, sigma_eps
+    return deviation, -1, phi, q_bar, model_type, sigma_eps
 
 def calculate_wilder_rsi(series, period=14):
     delta = series.diff()
@@ -171,14 +187,12 @@ def calculate_wilder_rsi(series, period=14):
     loss = -1 * delta.clip(upper=0)
     avg_gain = np.full(len(series), np.nan)
     avg_loss = np.full(len(series), np.nan)
-    
     if len(series) > period:
         avg_gain[period] = gain.iloc[1:period+1].mean()
         avg_loss[period] = loss.iloc[1:period+1].mean()
         for i in range(period + 1, len(series)):
             avg_gain[i] = ((avg_gain[i-1] * (period - 1)) + gain.iloc[i]) / period
             avg_loss[i] = ((avg_loss[i-1] * (period - 1)) + loss.iloc[i]) / period
-            
     rs = avg_gain / np.where(avg_loss == 0, np.nan, avg_loss)
     rsi = 100 - (100 / (1 + rs))
     rsi = np.where((avg_loss == 0) & (avg_gain > 0), 100, rsi)
@@ -191,7 +205,6 @@ def calculate_true_wilder_atr(df, window=14):
     high_close = np.abs(df['High'] - df['Close'].shift(1))
     low_close = np.abs(df['Low'] - df['Close'].shift(1))
     tr = np.maximum(high_low, np.maximum(high_close, low_close))
-    
     atr = np.full(len(tr), np.nan)
     if len(tr) > window:
         atr[window] = tr.iloc[1:window+1].mean()
@@ -202,79 +215,39 @@ def calculate_true_wilder_atr(df, window=14):
 def calculate_true_wilder_adx(df, window=14):
     up_move = df['High'] - df['High'].shift(1)
     down_move = df['Low'].shift(1) - df['Low']
-    
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    
-    tr = np.maximum(df['High'] - df['Low'], 
-                    np.maximum(np.abs(df['High'] - df['Close'].shift(1)), 
-                               np.abs(df['Low'] - df['Close'].shift(1))))
-    
+    tr = np.maximum(df['High'] - df['Low'], np.maximum(np.abs(df['High'] - df['Close'].shift(1)), np.abs(df['Low'] - df['Close'].shift(1))))
     tr_s = np.full(len(tr), np.nan)
     pdm_s = np.full(len(tr), np.nan)
     mdm_s = np.full(len(tr), np.nan)
-    
     if len(tr) > window:
         tr_s[window] = tr.iloc[1:window+1].mean()
         pdm_s[window] = pd.Series(plus_dm).iloc[1:window+1].mean()
         mdm_s[window] = pd.Series(minus_dm).iloc[1:window+1].mean()
-        
         for i in range(window+1, len(tr)):
             tr_s[i] = ((tr_s[i-1] * (window-1)) + tr.iloc[i]) / window
             pdm_s[i] = ((pdm_s[i-1] * (window-1)) + plus_dm[i]) / window
             mdm_s[i] = ((mdm_s[i-1] * (window-1)) + minus_dm[i]) / window
-            
     pdi = 100 * (pd.Series(pdm_s, index=df.index) / (pd.Series(tr_s, index=df.index) + 1e-9))
     mdi = 100 * (pd.Series(mdm_s, index=df.index) / (pd.Series(tr_s, index=df.index) + 1e-9))
-    
     dx = 100 * (np.abs(pdi - mdi) / (pdi + mdi + 1e-9))
-    
     adx = np.full(len(dx), np.nan)
     start_idx = 2 * window - 1
     if len(dx) > start_idx:
         adx[start_idx] = dx.iloc[window:start_idx+1].mean()
         for i in range(start_idx+1, len(dx)):
             adx[i] = ((adx[i-1] * (window-1)) + dx.iloc[i]) / window
-            
     adx_s = pd.Series(adx, index=df.index)
     return adx_s, pdi, mdi, adx_s > adx_s.shift(1)
 
-def log_forecast_to_csv(record):
-    file_exists = os.path.isfile(JOURNAL_FILE)
-    header_ok = True
-    if file_exists:
-        try:
-            with open(JOURNAL_FILE, 'r') as f:
-                first_line = f.readline().strip()
-                existing_cols = first_line.split(',')
-                if existing_cols != list(record.keys()):
-                    header_ok = False
-        except Exception:
-            header_ok = False
-
-    if not header_ok:
-        try:
-            os.rename(JOURNAL_FILE, f"{JOURNAL_FILE}.{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}")
-            file_exists = False
-        except Exception as e:
-            logger.error(f"Failed to rotate journal: {e}")
-
-    try:
-        with open(JOURNAL_FILE, mode='a', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=record.keys())
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(record)
-    except Exception as e:
-        logger.error(f"Failed to write to journal: {e}")
-
 # ==========================================
-# MACRO ENDPOINT
+# ENDPOINTS
 # ==========================================
 
 @app.get("/")
 def read_root():
-    return {"status": "API is running - Quant v4.3"}
+    return {"status": "API is running - Quant v5.0 (Supabase)"}
 
 @app.post("/forecast")
 def get_forecast(req: ForecastRequest):
@@ -304,47 +277,31 @@ def get_forecast(req: ForecastRequest):
         median_rate = float(np.exp(np.log(current_spot) + mean_delta))
         expected_rate = float(np.exp(np.log(current_spot) + mean_delta + (var_q / 2)))
         historical_data = [{"date": d.strftime("%Y-%m-%d"), "price": float(r['spot'])} for d, r in df.tail(60).iterrows()]
-        
-        macro_bias = "Neutral"
-        if model_type == "AR(1)_mean_reverting":
-            macro_bias = "Bearish" if deviation > 0 else "Bullish"
+        macro_bias = "Bearish" if (deviation > 0 and model_type == "AR(1)_mean_reverting") else "Bullish" if (deviation < 0 and model_type == "AR(1)_mean_reverting") else "Neutral"
 
         raw_response = {
             "current_state": {
-                "spot_rate": current_spot,
-                "ppp_equilibrium_estimate": ppp_anchor,
-                "deviation_q": float(deviation),
-                "half_life_years": half_life,
-                "macro_model": model_type,
-                "macro_bias": macro_bias,
-                "data_source_warning": "FRED API used."
+                "spot_rate": current_spot, "ppp_equilibrium_estimate": ppp_anchor,
+                "deviation_q": float(deviation), "half_life_years": half_life,
+                "macro_model": model_type, "macro_bias": macro_bias
             },
             "forecast": {
-                "p_up": float(p_up),
-                "expected_rate": expected_rate,
-                "median_rate": median_rate,
+                "p_up": float(p_up), "expected_rate": expected_rate, "median_rate": median_rate,
                 "ci_90_low": float(np.exp(np.log(current_spot) + mean_delta - 1.645 * std_delta)),
                 "ci_90_high": float(np.exp(np.log(current_spot) + mean_delta + 1.645 * std_delta))
             },
             "historical_data": historical_data
         }
-        
         return {"status": "success", "data": adapt_for_flutter(raw_response)}
     except Exception as e:
         logger.exception("Macro Forecast Error")
         raise HTTPException(status_code=500, detail={"status": "error", "message": "Internal calculation error"})
 
-# ==========================================
-# MICRO ENDPOINT (SHORT-TERM ML)
-# ==========================================
-
 @app.post("/short_term_forecast")
 def get_short_term_forecast(req: ShortTermRequest):
     try:
         # 1. Macro
-        macro_available = False
-        macro_bias = "Unavailable"
-        macro_dev = 0.0
+        macro_available, macro_bias, macro_dev = False, "Unavailable", 0.0
         try:
             cache_key = datetime.datetime.now().strftime("%Y-%m-%d-%H")
             df_macro = fetch_macro_data_cached(cache_key).copy()
@@ -353,12 +310,10 @@ def get_short_term_forecast(req: ShortTermRequest):
                 macro_available = True
                 macro_dev = macro_dev_temp
                 macro_bias = "Bearish" if macro_dev > 0 else "Bullish"
-        except Exception:
-            pass
+        except Exception: pass
 
-        # 2. Calendar (Fixed logic)
-        event_risk = "UNKNOWN"
-        calendar_available = False
+        # 2. Calendar
+        event_risk, calendar_available = "UNKNOWN", False
         if TWELVE_DATA_KEY:
             try:
                 cal_url = f"https://api.twelvedata.com/economic_calendar?country=US,EZ&apikey={TWELVE_DATA_KEY}"
@@ -371,26 +326,19 @@ def get_short_term_forecast(req: ShortTermRequest):
                         if raw_time:
                             try:
                                 event_time = pd.to_datetime(raw_time)
-                                if event_time.tzinfo is None:
-                                    event_time = event_time.tz_localize('UTC')
+                                if event_time.tzinfo is None: event_time = event_time.tz_localize('UTC')
                                 if event_time >= now: 
                                     valid_upcoming_events += 1
                                     if event.get('impact') == 'High' and event_time <= now + datetime.timedelta(days=req.forecast_days):
                                         event_risk = "HIGH"
-                            except Exception:
-                                continue
-                    
+                            except Exception: continue
                     if valid_upcoming_events > 0:
                         calendar_available = True
-                        if event_risk != "HIGH":
-                            event_risk = "LOW"
-            except Exception:
-                pass
+                        if event_risk != "HIGH": event_risk = "LOW"
+            except Exception: pass
 
         # 3. Data Fetch
-        df_eur = pd.DataFrame()
-        df_dxy = pd.DataFrame()
-        
+        df_eur, df_dxy = pd.DataFrame(), pd.DataFrame()
         if TWELVE_DATA_KEY:
             try:
                 url = f"https://api.twelvedata.com/time_series?symbol=EUR/USD&interval=1h&outputsize=1000&apikey={TWELVE_DATA_KEY}"
@@ -400,34 +348,27 @@ def get_short_term_forecast(req: ShortTermRequest):
                     df_eur['datetime'] = pd.to_datetime(df_eur['datetime'], utc=True) 
                     df_eur = df_eur.set_index('datetime').sort_index()
                     for col in ['open', 'high', 'low', 'close']:
-                        if col in df_eur.columns:
-                            df_eur[col] = pd.to_numeric(df_eur[col])
+                        if col in df_eur.columns: df_eur[col] = pd.to_numeric(df_eur[col])
                     df_eur = df_eur.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'})
-            except Exception:
-                pass
+            except Exception: pass
 
         try:
             df_dxy = yf.Ticker("DX-Y.NYB").history(period="90d", interval="1h", timeout=5)
             if not df_dxy.empty:
                 df_dxy.index = df_dxy.index.tz_convert('UTC') if df_dxy.index.tz else df_dxy.index.tz_localize('UTC')
-        except Exception:
-            pass
+        except Exception: pass
 
         if df_eur.empty or len(df_eur) < 200:
             try:
                 df_eur = yf.Ticker("EURUSD=X").history(period="90d", interval="1h", timeout=5)
                 if not df_eur.empty:
                     df_eur.index = df_eur.index.tz_convert('UTC') if df_eur.index.tz else df_eur.index.tz_localize('UTC')
-            except Exception:
-                pass
+            except Exception: pass
 
-        if df_eur.empty or len(df_eur) < 200:
-            raise ValueError("Data unavailable for EUR")
+        if df_eur.empty or len(df_eur) < 200: raise ValueError("Data unavailable for EUR")
 
         dxy_available = not df_dxy.empty
-        
         df_eur = df_eur[['Open', 'High', 'Low', 'Close']].rename(columns={'Close': 'Close_EUR'})
-        
         df = df_eur.copy()
         if dxy_available:
             df_dxy = df_dxy[['Close']].rename(columns={'Close': 'Close_DXY'})
@@ -458,90 +399,67 @@ def get_short_term_forecast(req: ShortTermRequest):
         df['Clean_Close'] = df['Close'].ewm(span=10, adjust=False).mean()
         df['ret_1h'] = df['Clean_Close'].pct_change(1)
         df['ret_24h'] = df['Clean_Close'].pct_change(24)
-        
         if dxy_available:
             df['Clean_DXY'] = df['Close_DXY'].ewm(span=10, adjust=False).mean()
             df['dxy_ret_1h'] = df['Clean_DXY'].pct_change(1)
             df['dxy_corr'] = df['ret_1h'].rolling(24).corr(df['dxy_ret_1h'])
         else:
-            df['dxy_ret_1h'] = 0.0
-            df['dxy_corr'] = 0.0
+            df['dxy_ret_1h'], df['dxy_corr'] = 0.0, 0.0
 
         df['sma_50'] = df['Clean_Close'].rolling(window=50).mean()
         df['dist_sma'] = (df['Clean_Close'] - df['sma_50']) / df['sma_50']
         df['trend_direction'] = np.where(df['Clean_Close'] > df['sma_50'], 1, -1)
         df['std_50'] = df['Clean_Close'].rolling(window=50).std()
         df['z_score'] = (df['Clean_Close'] - df['sma_50']) / (df['std_50'] + 1e-9)
-        
         df['rsi'] = calculate_wilder_rsi(df['Close'], period=14)
         df['rsi_extreme_low'] = (df['rsi'] <= 5).astype(int)
         df['rsi_extreme_high'] = (df['rsi'] >= 95).astype(int)
-
         df['atr'] = calculate_true_wilder_atr(df, window=14)
         df['adx'], df['plus_di'], df['minus_di'], df['adx_rising'] = calculate_true_wilder_adx(df)
         
         current_adx = float(df['adx'].iloc[-1]) if not pd.isna(df['adx'].iloc[-1]) else 0.0
         market_regime = "Unknown"
-        if current_adx > 25:
-            market_regime = "Strong Bullish Trend" if df['plus_di'].iloc[-1] > df['minus_di'].iloc[-1] else "Strong Bearish Trend"
-        elif current_adx > 20:
-            market_regime = "Weak Trend"
-        elif current_adx > 0:
-            market_regime = "Ranging"
+        if current_adx > 25: market_regime = "Strong Bullish Trend" if df['plus_di'].iloc[-1] > df['minus_di'].iloc[-1] else "Strong Bearish Trend"
+        elif current_adx > 20: market_regime = "Weak Trend"
+        elif current_adx > 0: market_regime = "Ranging"
 
         df['range_size'] = df['High'] - df['Low']
         df['range_mean'] = df['range_size'].rolling(window=24).mean()
         df['range_spike'] = np.where(df['range_size'] > (df['range_mean'] * 1.5), 1, 0)
-        
-        df['prev_high'] = df['High'].shift(1)
-        df['prev_low'] = df['Low'].shift(1)
+        df['prev_high'], df['prev_low'] = df['High'].shift(1), df['Low'].shift(1)
         df['bearish_sweep'] = np.where((df['High'] > df['prev_high']) & (df['Close'] < df['prev_high']) & (df['range_spike'] == 1), -1, 0)
         df['bullish_sweep'] = np.where((df['Low'] < df['prev_low']) & (df['Close'] > df['prev_low']) & (df['range_spike'] == 1), 1, 0)
         df['net_sweep'] = df['bullish_sweep'] + df['bearish_sweep']
 
         window = 5
-        df['swing_high'] = df['High'].rolling(window=window).max()
-        df['swing_low'] = df['Low'].rolling(window=window).min()
+        df['swing_high'], df['swing_low'] = df['High'].rolling(window=window).max(), df['Low'].rolling(window=window).min()
         df['near_swing_high'] = np.where(df['Close'] > df['swing_high'] * 0.998, 1, 0)
         df['near_swing_low'] = np.where(df['Close'] < df['swing_low'] * 1.002, 1, 0)
 
         periods_ahead = req.forecast_days * 24 
-        
         df['target_end_time'] = df.index.to_series().shift(-periods_ahead)
-        df['target'] = np.where(
-            df['Close'].shift(-periods_ahead).notna(),
-            (df['Close'].shift(-periods_ahead) > df['Close']).astype(float),
-            np.nan
-        )
+        df['target'] = np.where(df['Close'].shift(-periods_ahead).notna(), (df['Close'].shift(-periods_ahead) > df['Close']).astype(float), np.nan)
         
         features = ['ret_1h', 'ret_24h', 'dist_sma', 'rsi', 'rsi_extreme_low', 'rsi_extreme_high', 
                     'range_spike', 'net_sweep', 'near_swing_high', 'near_swing_low', 'trend_direction', 'z_score']
-        
-        if dxy_available:
-            features.extend(['dxy_ret_1h', 'dxy_corr'])
+        if dxy_available: features.extend(['dxy_ret_1h', 'dxy_corr'])
         
         X_live = df[features].iloc[-1:].copy()
-        if X_live.isna().any().any() or not np.isfinite(X_live).all().all():
-            raise ValueError("Live feature vector contains missing or non-finite values.")
+        if X_live.isna().any().any() or not np.isfinite(X_live).all().all(): raise ValueError("Live feature vector contains missing/non-finite values.")
 
         df_train = df.dropna(subset=features + ['target']).copy()
-        
         split_idx = int(len(df_train) * 0.75)
         val_start_time = df_train.index[split_idx]
-        
         train_df = df_train[df_train['target_end_time'] < val_start_time]
         test_df = df_train[df_train.index >= val_start_time]
         
-        if len(train_df) < 150:
-            raise ValueError("Insufficient post-purge training data.")
+        if len(train_df) < 150: raise ValueError("Insufficient post-purge training data.")
 
         base_xgb = xgb.XGBClassifier(n_estimators=50, learning_rate=0.05, max_depth=3, objective='binary:logistic', eval_metric='logloss')
         base_rf = RandomForestClassifier(n_estimators=50, max_depth=4, random_state=42)
-
         base_xgb.fit(train_df[features], train_df['target'])
         base_rf.fit(train_df[features], train_df['target'])
 
-        # Validation Metrics
         brier, acc, baseline_brier, baseline_acc, bss = None, None, None, None, None
         val_sample_count = len(test_df)
         if val_sample_count > 10:
@@ -552,27 +470,20 @@ def get_short_term_forecast(req: ShortTermRequest):
             baseline_preds = np.full(len(test_df), baseline_prob)
             baseline_brier = float(brier_score_loss(test_df['target'], baseline_preds))
             baseline_acc = float(accuracy_score(test_df['target'], (baseline_preds > 0.5).astype(int)))
-            if baseline_brier > 0:
-                bss = float(1.0 - (brier / baseline_brier))
+            if baseline_brier > 0: bss = float(1.0 - (brier / baseline_brier))
 
-        # Deploy Models
-        final_xgb = xgb.XGBClassifier(n_estimators=50, learning_rate=0.05, max_depth=3, objective='binary:logistic', eval_metric='logloss')
-        final_rf = RandomForestClassifier(n_estimators=50, max_depth=4, random_state=42)
+        final_xgb, final_rf = xgb.XGBClassifier(n_estimators=50, learning_rate=0.05, max_depth=3, objective='binary:logistic'), RandomForestClassifier(n_estimators=50, max_depth=4, random_state=42)
         final_xgb.fit(df_train[features], df_train['target'])
         final_rf.fit(df_train[features], df_train['target'])
 
         p_up_xgb = float(final_xgb.predict_proba(X_live)[0][1])
         p_up_rf = float(final_rf.predict_proba(X_live)[0][1])
         p_up_pure = (p_up_xgb * 0.5) + (p_up_rf * 0.5)
-        model_disagreement = float(abs(p_up_xgb - p_up_rf))
 
         current_atr = float(df['atr'].iloc[-1]) if not pd.isna(df['atr'].iloc[-1]) else None
-        
-        # FIXED: Strict ATR Guardrail
         if current_atr is None or not np.isfinite(current_atr) or current_atr <= 0:
             fallback_tr = (df['High'] - df['Low']).tail(14).mean() 
-            if not np.isfinite(fallback_tr) or fallback_tr <= 0:
-                raise ValueError("Invalid ATR and fallback. Forecast aborted.")
+            if not np.isfinite(fallback_tr) or fallback_tr <= 0: raise ValueError("Invalid ATR")
             current_atr = fallback_tr
 
         current_rsi = float(df['rsi'].iloc[-1]) if not pd.isna(df['rsi'].iloc[-1]) else 50.0
@@ -584,8 +495,6 @@ def get_short_term_forecast(req: ShortTermRequest):
 
         SPREAD_PIPS = 0.00015 
         expected_move = current_atr * 1.5 
-        
-        # FIXED: BSS is now used as a validation gate
         validation_pass = (bss is not None and bss > 0.0 and val_sample_count >= 10)
         
         raw_signal = "HOLD"
@@ -605,36 +514,26 @@ def get_short_term_forecast(req: ShortTermRequest):
         elif signal == "BUY":
             if current_trend == -1 or current_z > 2.5: signal = "HOLD" 
 
+        target_price = None
+        stop_loss = None
         if signal == "BUY":
             target_price = current_price + (3.0 * current_atr) 
             stop_loss = current_price - (1.5 * current_atr)
         elif signal == "SELL":
             target_price = current_price - (3.0 * current_atr)
             stop_loss = current_price + (1.5 * current_atr)
-        else:
-            target_price = None
-            stop_loss = None
 
-        history = [{"date": d.strftime("%Y-%m-%d %H:%M:%S"), "price": float(r['Close'])} for d, r in df.tail(48).iterrows()]
+        # --- SUPABASE & TELEGRAM LOGIC ---
+        last_signal, last_alert_time = get_last_signal_db()
+        current_time = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        cooldown_period = 14400 
+        can_send_alert = (current_time - last_alert_time) > cooldown_period
 
-        journal_record = {
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "spot": current_price, "prob_up": round(p_up_pure, 4), "signal": signal,
-            "target": round(target_price, 5) if target_price else None, "stop": round(stop_loss, 5) if stop_loss else None,
-            "mtf_trend": mtf_alignment, "regime": market_regime, "adx": round(current_adx, 2)
-        }
-        log_forecast_to_csv(journal_record)
-
-        # --- NEW: TELEGRAM NOTIFICATION LOGIC ---
-        last_signal = get_last_signal()
-        
         if signal != last_signal:
-            if signal in ["BUY", "SELL"]:
-                # Safely format numbers to avoid crashes
+            if signal in ["BUY", "SELL"] and can_send_alert:
                 tp_str = f"{target_price:.5f}" if target_price is not None else "N/A"
                 sl_str = f"{stop_loss:.5f}" if stop_loss is not None else "N/A"
                 bss_str = f"{bss*100:.1f}%" if bss is not None else "N/A"
-                
                 alert_msg = (
                     f"🚨 *NEW {signal} SIGNAL* 🚨\n\n"
                     f"💵 *Asset:* EUR/USD\n"
@@ -645,104 +544,71 @@ def get_short_term_forecast(req: ShortTermRequest):
                     f"⚖️ *Brier Edge:* {bss_str}"
                 )
                 send_telegram_alert(alert_msg)
+                update_last_signal_db(signal, current_time)
             elif signal == "HOLD" and last_signal in ["BUY", "SELL"]:
                 send_telegram_alert(f"🔔 *Trade Closed / Signal Faded* 🔔\nEUR/USD is now back to HOLD.")
-            
-            update_last_signal(signal)
-        # ----------------------------------------
+                update_last_signal_db(signal, current_time)
+            elif signal != last_signal:
+                update_last_signal_db(signal, last_alert_time)
+
+        # Write to Supabase Journal
+        journal_record = {
+            "spot_price": current_price, "prob_up": round(p_up_pure, 4), "signal": signal,
+            "target_price": round(target_price, 5) if target_price else None, "stop_loss": round(stop_loss, 5) if stop_loss else None,
+            "mtf_trend": mtf_alignment, "regime": market_regime, "adx": round(current_adx, 2)
+        }
+        log_forecast_to_db(journal_record)
+        # ---------------------------------
 
         raw_response = {
-            "current_price": current_price,
-            "forecast_days": req.forecast_days,
-            "probability_up": float(p_up_pure),
-            "xgb_probability": p_up_xgb,
-            "rf_probability": p_up_rf,
-            "model_disagreement": model_disagreement,
-            "target_up_rate": float(train_df['target'].mean()),
-            "validation_brier_score": brier,
-            "validation_accuracy": acc,
-            "baseline_brier_score": baseline_brier,
-            "baseline_accuracy": baseline_acc,
-            "brier_skill_score": bss,
-            "validation_sample_count": val_sample_count,
-            "signal": signal,
-            "raw_signal": raw_signal,
-            "horizon_conflict": horizon_conflict,
-            "mtf_trend": mtf_alignment,
-            "market_regime": market_regime,
-            "adx_value": current_adx,
-            "plus_di": current_plus_di,
-            "minus_di": current_minus_di,
-            "adx_rising": adx_is_rising,
-            "calendar_available": calendar_available,
-            "target_price": target_price,
-            "stop_loss": stop_loss,
-            "last_rsi": float(current_rsi),
-            "macro_bias": macro_bias,
-            "whale_trap_detected": bool(df['net_sweep'].iloc[-1] != 0),
-            "event_risk": event_risk,
-            "dxy_available": dxy_available,
-            "dxy_correlation": float(df['dxy_corr'].iloc[-1]) if dxy_available and not pd.isna(df['dxy_corr'].iloc[-1]) else None,
+            "current_price": current_price, "forecast_days": req.forecast_days,
+            "probability_up": float(p_up_pure), "xgb_probability": p_up_xgb, "rf_probability": p_up_rf,
+            "model_disagreement": float(abs(p_up_xgb - p_up_rf)), "target_up_rate": float(train_df['target'].mean()),
+            "validation_brier_score": brier, "validation_accuracy": acc, "baseline_brier_score": baseline_brier,
+            "baseline_accuracy": baseline_acc, "brier_skill_score": bss, "validation_sample_count": val_sample_count,
+            "signal": signal, "raw_signal": raw_signal, "horizon_conflict": horizon_conflict, "mtf_trend": mtf_alignment,
+            "market_regime": market_regime, "adx_value": current_adx, "plus_di": current_plus_di,
+            "minus_di": current_minus_di, "adx_rising": adx_is_rising, "calendar_available": calendar_available,
+            "target_price": target_price, "stop_loss": stop_loss, "last_rsi": float(current_rsi),
+            "macro_bias": macro_bias, "whale_trap_detected": bool(df['net_sweep'].iloc[-1] != 0),
+            "event_risk": event_risk, "dxy_available": dxy_available, "dxy_correlation": float(df['dxy_corr'].iloc[-1]) if dxy_available and not pd.isna(df['dxy_corr'].iloc[-1]) else None,
             "trend_direction": "Up" if current_trend == 1 else "Down" if current_trend == -1 else "Unknown",
-            "estimated_zscore_half_life_hours": 0.0,
-            "recommended_position_size_pct": 0.0,
-            "model_weights": {"xgb": 0.5, "rf": 0.5},
-            "forecast_horizon_type": "trading_candles",
-            "forecast_horizon_candles": periods_ahead,
-            "forecast_horizon_requested_days": req.forecast_days,
-            "atr_value": current_atr,
-            "history": history,
-            "forecast_valid": True,
-            "response_state": "normal"
+            "estimated_zscore_half_life_hours": 0.0, "recommended_position_size_pct": 0.0,
+            "model_weights": {"xgb": 0.5, "rf": 0.5}, "forecast_horizon_type": "trading_candles",
+            "forecast_horizon_candles": periods_ahead, "forecast_horizon_requested_days": req.forecast_days,
+            "atr_value": current_atr, "history": [], "forecast_valid": True, "response_state": "normal"
         }
-        
         return {"status": "success", "data": adapt_for_flutter(raw_response)}
 
     except Exception as e:
         logger.exception("Short-term forecast failed")
         fallback_response = {
-            "current_price": 0.0, "forecast_days": req.forecast_days,
-            "probability_up": 0.0, "xgb_probability": 0.0, "rf_probability": 0.0,
-            "model_disagreement": 0.0, "target_up_rate": 0.0,
-            "validation_brier_score": None, "validation_accuracy": None,
-            "baseline_brier_score": None, "baseline_accuracy": None,
-            "brier_skill_score": None, "validation_sample_count": 0,
-            "signal": "HOLD", "raw_signal": "HOLD",
-            "horizon_conflict": "Unknown", "mtf_trend": "Unknown",
-            "market_regime": "Unknown", "adx_value": None,
-            "plus_di": None, "minus_di": None, "adx_rising": False,
-            "calendar_available": False, "target_price": None, "stop_loss": None,
-            "last_rsi": 0.0, "macro_bias": "Unavailable", "whale_trap_detected": False,
-            "event_risk": "UNKNOWN", "dxy_available": False, "dxy_correlation": None,
-            "trend_direction": "Unknown", "estimated_zscore_half_life_hours": None,
+            "current_price": 0.0, "forecast_days": req.forecast_days, "probability_up": 0.0, "xgb_probability": 0.0,
+            "rf_probability": 0.0, "model_disagreement": 0.0, "target_up_rate": 0.0, "validation_brier_score": None,
+            "validation_accuracy": None, "baseline_brier_score": None, "baseline_accuracy": None, "brier_skill_score": None,
+            "validation_sample_count": 0, "signal": "HOLD", "raw_signal": "HOLD", "horizon_conflict": "Unknown",
+            "mtf_trend": "Unknown", "market_regime": "Unknown", "adx_value": None, "plus_di": None, "minus_di": None,
+            "adx_rising": False, "calendar_available": False, "target_price": None, "stop_loss": None, "last_rsi": 0.0,
+            "macro_bias": "Unavailable", "whale_trap_detected": False, "event_risk": "UNKNOWN", "dxy_available": False,
+            "dxy_correlation": None, "trend_direction": "Unknown", "estimated_zscore_half_life_hours": None,
             "recommended_position_size_pct": 0.0, "model_weights": {"xgb": 0.5, "rf": 0.5},
             "forecast_horizon_type": "trading_candles", "forecast_horizon_candles": req.forecast_days * 24,
-            "forecast_horizon_requested_days": req.forecast_days, "atr_value": 0.0,
-            "history": [],
-            "forecast_valid": False,
-            "response_state": "degraded",
-            "error_code": "CALCULATION_ERROR"
+            "forecast_horizon_requested_days": req.forecast_days, "atr_value": 0.0, "history": [],
+            "forecast_valid": False, "response_state": "degraded", "error_code": "CALCULATION_ERROR"
         }
         return {"status": "degraded", "data": adapt_for_flutter(fallback_response)}
 
 @app.get("/journal")
 def get_journal():
-    if not os.path.isfile(JOURNAL_FILE):
+    if not SUPABASE_URL or not SUPABASE_KEY:
         return {"status": "success", "journal": []}
     try:
-        with open(JOURNAL_FILE, mode='r') as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
-            return {"status": "success", "journal": rows[-20:]}
+        url = f"{SUPABASE_URL}/rest/v1/forecast_journal?select=*&order=timestamp.desc&limit=20"
+        res = requests.get(url, headers=get_supabase_headers(), timeout=5)
+        return {"status": "success", "journal": res.json()}
     except Exception:
         return {"status": "success", "journal": []}
 
-@app.get("/export_journal")
-def export_journal():
-    if not os.path.isfile(JOURNAL_FILE):
-        raise HTTPException(status_code=404, detail="Journal is empty")
-    return FileResponse(JOURNAL_FILE, media_type="text/csv", filename="forecast_journal_backup.csv")
-
 @app.post("/backtest")
 def backtest(req: ShortTermRequest):
-    return {"status": "success", "message": "Backtest endpoint placeholder. Awaiting full chronological engine."}
+    return {"status": "success", "message": "Backtest endpoint placeholder."}

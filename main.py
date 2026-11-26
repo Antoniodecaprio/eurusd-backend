@@ -42,6 +42,15 @@ TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") # <-- NEW
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")     # <-- NEW
 
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+ENABLE_TELEGRAM_ALERTS = os.getenv("ENABLE_TELEGRAM_ALERTS", "false").strip().lower() == "true"
+
+JOURNAL_LEGACY_FIELDS = [
+    "timestamp", "spot", "prob_up", "signal", "target", "stop",
+    "mtf_trend", "regime", "adx"
+]
+
 JOURNAL_FILE = "forecast_journal.csv"
 STATE_FILE = "last_signal_state.json"                # <-- NEW
 

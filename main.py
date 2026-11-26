@@ -905,9 +905,10 @@ def get_journal():
 
 @app.get("/export_journal")
 def export_journal():
-    if not os.path.isfile(JOURNAL_FILE):
+    rows = get_journal_rows(limit=None)
+    if not rows:
         raise HTTPException(status_code=404, detail="Journal is empty")
-    return FileResponse(JOURNAL_FILE, media_type="text/csv", filename="forecast_journal_backup.csv")
+    return build_journal_csv_response(rows)
 
 @app.post("/backtest")
 def backtest(req: ShortTermRequest):

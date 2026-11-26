@@ -279,6 +279,169 @@ def log_forecast_to_csv(record):
     except Exception as e:
         logger.error(f"Failed to write to journal: {e}")
 
+
+
+def _supabase_is_configured():
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def _supabase_headers(prefer=None):
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def _legacy_row_from_supabase(row):
+    """Translate database column names back to the old FlutterFlow journal schema."""
+    spot = row.get("spot_price")
+    if spot is None:
+        spot = row.get("current_price")
+
+    probability = row.get("prob_up")
+    if probability is None:
+        probability = row.get("probability_up")
+
+    legacy = {
+        "timestamp": row.get("timestamp") or row.get("created_at") or "",
+        "spot": spot,
+        "prob_up": probability,
+        "signal": row.get("signal"),
+        "target": row.get("target_price"),
+        "stop": row.get("stop_loss"),
+        "mtf_trend": row.get("mtf_trend"),
+        "regime": row.get("regime"),
+        "adx": row.get("adx"),
+    }
+    return {
+        key: "" if value is None else str(value)
+        for key, value in legacy.items()
+    }
+
+
+def _read_local_journal():
+    if not os.path.isfile(JOURNAL_FILE):
+        return []
+    try:
+        with open(JOURNAL_FILE, mode="r", newline="") as file:
+            reader = csv.DictReader(file)
+            return [
+                {key: (row.get(key) or "") for key in JOURNAL_LEGACY_FIELDS}
+                for row in reader
+            ]
+    except Exception:
+        logger.exception("Failed to read local CSV journal")
+        return []
+
+
+def _fetch_supabase_journal(limit=20, offset=0, order="timestamp.desc"):
+    url = f"{SUPABASE_URL}/rest/v1/forecast_journal"
+    params = {
+        "select": "timestamp,created_at,spot_price,current_price,prob_up,probability_up,signal,target_price,stop_loss,mtf_trend,regime,adx",
+        "order": order,
+        "limit": str(limit),
+        "offset": str(offset),
+    }
+    response = requests.get(
+        url,
+        headers=_supabase_headers(),
+        params=params,
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise ValueError("Unexpected Supabase journal response")
+    return payload
+
+
+def save_journal_record(record):
+    """Write to Supabase; preserve a local CSV fallback if that fails."""
+    if _supabase_is_configured():
+        try:
+            spot = record.get("spot")
+            probability = record.get("prob_up")
+            database_record = {
+                "timestamp": record.get("timestamp"),
+                "spot_price": spot,
+                "prob_up": probability,
+                "signal": record.get("signal"),
+                "target_price": record.get("target"),
+                "stop_loss": record.get("stop"),
+                "mtf_trend": record.get("mtf_trend"),
+                "regime": record.get("regime"),
+                "adx": record.get("adx"),
+                "current_price": spot,
+                "forecast_days": record.get("forecast_days"),
+                "probability_up": probability,
+                "symbol": "EUR/USD",
+                "payload": {"legacy_record": record},
+            }
+            url = f"{SUPABASE_URL}/rest/v1/forecast_journal"
+            response = requests.post(
+                url,
+                headers=_supabase_headers("return=minimal"),
+                json=database_record,
+                timeout=10,
+            )
+            response.raise_for_status()
+            logger.info("Forecast journal record saved to Supabase")
+            return
+        except Exception:
+            logger.exception("Supabase journal write failed; using local CSV fallback")
+
+    log_forecast_to_csv(record)
+
+
+def get_journal_rows(limit=None):
+    """Return legacy-shaped journal rows, oldest first."""
+    if _supabase_is_configured():
+        try:
+            if limit is not None:
+                db_rows = _fetch_supabase_journal(
+                    limit=limit, offset=0, order="timestamp.desc"
+                )
+                return [_legacy_row_from_supabase(row) for row in reversed(db_rows)]
+
+            all_rows = []
+            page_size = 1000
+            max_rows = 50000
+            while len(all_rows) < max_rows:
+                db_rows = _fetch_supabase_journal(
+                    limit=min(page_size, max_rows - len(all_rows)),
+                    offset=len(all_rows),
+                    order="timestamp.asc",
+                )
+                all_rows.extend(_legacy_row_from_supabase(row) for row in db_rows)
+                if len(db_rows) < page_size:
+                    break
+            if len(all_rows) >= max_rows:
+                logger.warning("Journal export reached the 50,000-row safety limit")
+            return all_rows
+        except Exception:
+            logger.exception("Supabase journal read failed; trying local CSV fallback")
+
+    rows = _read_local_journal()
+    return rows[-limit:] if limit is not None else rows
+
+
+def build_journal_csv_response(rows):
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=JOURNAL_LEGACY_FIELDS)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: row.get(key, "") for key in JOURNAL_LEGACY_FIELDS})
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="forecast_journal_backup.csv"'},
+    )
+
+
 # ==========================================
 # MACRO ENDPOINT
 # ==========================================

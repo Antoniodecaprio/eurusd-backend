@@ -18,7 +18,7 @@ import datetime
 import logging
 import csv
 import io
-import json  
+import json
 from statsmodels.tsa.stattools import adfuller
 from functools import lru_cache
 
@@ -38,8 +38,8 @@ app.add_middleware(
 
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") 
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")     
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -51,7 +51,7 @@ JOURNAL_LEGACY_FIELDS = [
 ]
 
 JOURNAL_FILE = "forecast_journal.csv"
-STATE_FILE = "last_signal_state.json"                
+STATE_FILE = "last_signal_state.json"
 
 class ShortTermRequest(BaseModel):
     forecast_days: int = Field(default=3, ge=1, le=7)
@@ -69,14 +69,14 @@ def adapt_for_flutter(data: dict) -> dict:
     """Converts None to 0.0 for FlutterFlow's strict typing."""
     safe_data = data.copy()
     numeric_keys = [
-        'current_price', 'target_price', 'stop_loss', 'probability_up', 'xgb_probability', 
-        'rf_probability', 'model_disagreement', 'target_up_rate', 'validation_brier_score', 
-        'validation_accuracy', 'baseline_brier_score', 'baseline_accuracy', 'brier_skill_score', 
-        'adx_value', 'plus_di', 'minus_di', 'last_rsi', 'dxy_correlation', 
-        'estimated_zscore_half_life_hours', 'atr_value', 'macro_deviation_q', 
+        'current_price', 'target_price', 'stop_loss', 'probability_up', 'xgb_probability',
+        'rf_probability', 'model_disagreement', 'target_up_rate', 'validation_brier_score',
+        'validation_accuracy', 'baseline_brier_score', 'baseline_accuracy', 'brier_skill_score',
+        'adx_value', 'plus_di', 'minus_di', 'last_rsi', 'dxy_correlation',
+        'estimated_zscore_half_life_hours', 'atr_value', 'macro_deviation_q',
         'reference_price', 'reference_discrepancy_pct'
     ]
-    
+
     for k in numeric_keys:
         if k in safe_data:
             val = safe_data[k]
@@ -85,10 +85,10 @@ def adapt_for_flutter(data: dict) -> dict:
                 safe_data[f"{k}_available"] = False
             else:
                 safe_data[f"{k}_available"] = True
-                
+
     if safe_data.get('trend_direction') not in ['Up', 'Down']:
         safe_data['trend_direction'] = 'Unknown'
-        
+
     return safe_data
 
 def get_last_signal():
@@ -133,7 +133,7 @@ def fetch_macro_data_cached(cache_buster: str):
     spot = to_month_end(fred.get_series('DEXUSEU'))
     us_cpi = to_month_end(fred.get_series('CPIAUCSL')).shift(1)
     ez_cpi = to_month_end(fred.get_series('CP0000EZ19M086NEST')).shift(1)
-    
+
     df = pd.DataFrame({'spot': spot, 'us_cpi': us_cpi, 'ez_cpi': ez_cpi}).dropna()
     df = df[df.index >= '1999-01-01']
     df['s'] = np.log(df['spot'])
@@ -146,7 +146,7 @@ def get_macro_state(df):
     df['q_lag'] = df['q'].shift(1)
     df_ols = df.dropna().copy()
     slope, intercept, _, _, _ = linregress(df_ols['q_lag'], df_ols['q'])
-    
+
     try:
         adf_p = adfuller(df['q'], regression="c", autolag="AIC")[1]
     except:
@@ -158,7 +158,7 @@ def get_macro_state(df):
     gmm.fit(valid_resids.values.reshape(-1, 1))
     regimes = gmm.predict(valid_resids.values.reshape(-1, 1))
     current_regime = int(regimes[-1])
-    
+
     if 0.0 < slope < 1.0 and adf_p < 0.05:
         phi = slope
         q_bar = intercept / (1 - phi)
@@ -181,14 +181,14 @@ def calculate_wilder_rsi(series, period=14):
     loss = -1 * delta.clip(upper=0)
     avg_gain = np.full(len(series), np.nan)
     avg_loss = np.full(len(series), np.nan)
-    
+
     if len(series) > period:
         avg_gain[period] = gain.iloc[1:period+1].mean()
         avg_loss[period] = loss.iloc[1:period+1].mean()
         for i in range(period + 1, len(series)):
             avg_gain[i] = ((avg_gain[i-1] * (period - 1)) + gain.iloc[i]) / period
             avg_loss[i] = ((avg_loss[i-1] * (period - 1)) + loss.iloc[i]) / period
-            
+
     rs = avg_gain / np.where(avg_loss == 0, np.nan, avg_loss)
     rsi = 100 - (100 / (1 + rs))
     rsi = np.where((avg_loss == 0) & (avg_gain > 0), 100, rsi)
@@ -201,7 +201,7 @@ def calculate_true_wilder_atr(df, window=14):
     high_close = np.abs(df['High'] - df['Close'].shift(1))
     low_close = np.abs(df['Low'] - df['Close'].shift(1))
     tr = np.maximum(high_low, np.maximum(high_close, low_close))
-    
+
     atr = np.full(len(tr), np.nan)
     if len(tr) > window:
         atr[window] = tr.iloc[1:window+1].mean()
@@ -212,40 +212,40 @@ def calculate_true_wilder_atr(df, window=14):
 def calculate_true_wilder_adx(df, window=14):
     up_move = df['High'] - df['High'].shift(1)
     down_move = df['Low'].shift(1) - df['Low']
-    
+
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    
-    tr = np.maximum(df['High'] - df['Low'], 
-                    np.maximum(np.abs(df['High'] - df['Close'].shift(1)), 
+
+    tr = np.maximum(df['High'] - df['Low'],
+                    np.maximum(np.abs(df['High'] - df['Close'].shift(1)),
                                np.abs(df['Low'] - df['Close'].shift(1))))
-    
+
     tr_s = np.full(len(tr), np.nan)
     pdm_s = np.full(len(tr), np.nan)
     mdm_s = np.full(len(tr), np.nan)
-    
+
     if len(tr) > window:
         tr_s[window] = tr.iloc[1:window+1].mean()
         pdm_s[window] = pd.Series(plus_dm).iloc[1:window+1].mean()
         mdm_s[window] = pd.Series(minus_dm).iloc[1:window+1].mean()
-        
+
         for i in range(window+1, len(tr)):
             tr_s[i] = ((tr_s[i-1] * (window-1)) + tr.iloc[i]) / window
             pdm_s[i] = ((pdm_s[i-1] * (window-1)) + plus_dm[i]) / window
             mdm_s[i] = ((mdm_s[i-1] * (window-1)) + minus_dm[i]) / window
-            
+
     pdi = 100 * (pd.Series(pdm_s, index=df.index) / (pd.Series(tr_s, index=df.index) + 1e-9))
     mdi = 100 * (pd.Series(mdm_s, index=df.index) / (pd.Series(tr_s, index=df.index) + 1e-9))
-    
+
     dx = 100 * (np.abs(pdi - mdi) / (pdi + mdi + 1e-9))
-    
+
     adx = np.full(len(dx), np.nan)
     start_idx = 2 * window - 1
     if len(dx) > start_idx:
         adx[start_idx] = dx.iloc[window:start_idx+1].mean()
         for i in range(start_idx+1, len(dx)):
             adx[i] = ((adx[i-1] * (window-1)) + dx.iloc[i]) / window
-            
+
     adx_s = pd.Series(adx, index=df.index)
     return adx_s, pdi, mdi, adx_s > adx_s.shift(1)
 
@@ -445,7 +445,7 @@ def get_forecast(req: ForecastRequest):
         df = fetch_macro_data_cached(cache_key).copy()
         current_spot = float(df['spot'].iloc[-1])
         deviation, _, phi, q_bar, model_type, sigma_eps = get_macro_state(df)
-        
+
         if model_type == "AR(1)_mean_reverting":
             current_q = np.log(current_spot) + df['p_us'].iloc[-1] - df['p_ez'].iloc[-1]
             half_life = np.log(0.5) / np.log(phi) / 12
@@ -466,7 +466,7 @@ def get_forecast(req: ForecastRequest):
         median_rate = float(np.exp(np.log(current_spot) + mean_delta))
         expected_rate = float(np.exp(np.log(current_spot) + mean_delta + (var_q / 2)))
         historical_data = [{"date": d.strftime("%Y-%m-%d"), "price": float(r['spot'])} for d, r in df.tail(60).iterrows()]
-        
+
         macro_bias = "Neutral"
         if model_type == "AR(1)_mean_reverting":
             macro_bias = "Bearish" if deviation > 0 else "Bullish"
@@ -490,7 +490,7 @@ def get_forecast(req: ForecastRequest):
             },
             "historical_data": historical_data
         }
-        
+
         return {"status": "success", "data": adapt_for_flutter(raw_response)}
     except Exception as e:
         logger.exception("Macro Forecast Error")
@@ -514,48 +514,197 @@ def get_short_term_forecast(req: ShortTermRequest):
         except Exception:
             pass
 
-        # 2. Calendar
+        # 2. Economic Calendar — fail-closed until coverage is proven
+        #
+        # Coverage is only claimed if we have POSITIVE evidence:
+        #   (A) explicit meta range with end_date >= horizon_end, OR
+        #   (B) structural span: at least one event <= now AND one >= horizon_end,
+        #       plus density >= 2 distinct days (rejects single-cluster payloads)
+        #
+        # Absent (A) or (B), event_risk stays UNKNOWN and the signal gate blocks.
+
         event_risk = "UNKNOWN"
         calendar_available = False
+
+        calendar_diagnostics = {
+            "response_received": False,
+            "events_returned": 0,
+            "meta_present": False,
+            "meta_covers_horizon": False,
+            "span_check_passed": False,
+            "density_check_passed": False,
+            "coverage_evidence": "none",
+            "reason": "not_attempted",
+        }
+
         if TWELVE_DATA_KEY:
             try:
-                cal_url = f"https://api.twelvedata.com/economic_calendar?country=US,EZ&apikey={TWELVE_DATA_KEY}"
-                cal_res = requests.get(cal_url, timeout=4).json()
-                if 'data' in cal_res and len(cal_res['data']) > 0:
-                    valid_upcoming_events = 0
-                    now = datetime.datetime.now(datetime.timezone.utc)
-                    for event in cal_res['data']:
-                        raw_time = event.get('date')
-                        if raw_time:
-                            try:
-                                event_time = pd.to_datetime(raw_time)
-                                if event_time.tzinfo is None:
-                                    event_time = event_time.tz_localize('UTC')
-                                if event_time >= now: 
-                                    valid_upcoming_events += 1
-                                    if event.get('impact') == 'High' and event_time <= now + datetime.timedelta(days=req.forecast_days):
-                                        event_risk = "HIGH"
-                            except Exception:
+                cal_url = (
+                    "https://api.twelvedata.com/economic_calendar"
+                    f"?country=US,EZ&apikey={TWELVE_DATA_KEY}"
+                )
+                cal_response = requests.get(cal_url, timeout=5)
+                cal_response.raise_for_status()
+                cal_res = cal_response.json()
+                calendar_diagnostics["response_received"] = True
+
+                now = datetime.datetime.now(datetime.timezone.utc)
+                horizon_end = now + datetime.timedelta(days=req.forecast_days)
+
+                events = cal_res.get("data", [])
+                meta = (
+                    cal_res.get("meta")
+                    or cal_res.get("pagination")
+                    or cal_res.get("range")
+                    or {}
+                )
+                calendar_diagnostics["meta_present"] = bool(meta)
+                calendar_diagnostics["events_returned"] = (
+                    len(events) if isinstance(events, list) else 0
+                )
+
+                # --- One-time diagnostic capture of the real payload ---
+                SAMPLE_FILE = "calendar_response_sample.json"
+                if (
+                    not os.path.exists(SAMPLE_FILE)
+                    and (calendar_diagnostics["events_returned"] > 0 or meta)
+                ):
+                    try:
+                        with open(SAMPLE_FILE, "w") as f:
+                            json.dump(
+                                {
+                                    "captured_at": now.isoformat(),
+                                    "request_url_redacted": cal_url.replace(
+                                        TWELVE_DATA_KEY, "***"
+                                    ),
+                                    "forecast_days": req.forecast_days,
+                                    "horizon_end": horizon_end.isoformat(),
+                                    "top_level_keys": list(cal_res.keys()),
+                                    "meta_keys": list(meta.keys()) if meta else [],
+                                    "sample_events": (
+                                        events[:3]
+                                        if isinstance(events, list)
+                                        else []
+                                    ),
+                                    "full_response": cal_res,
+                                },
+                                f,
+                                indent=2,
+                                default=str,
+                            )
+                        logger.info(
+                            f"Wrote {SAMPLE_FILE} — inspect this to verify "
+                            f"Twelve Data coverage fields."
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to write calendar diagnostic sample",
+                            exc_info=True,
+                        )
+
+                # --- Coverage proof A: explicit meta range ---
+                meta_covers = False
+                meta_end_raw = meta.get("end_date") or meta.get("end")
+                if meta_end_raw:
+                    try:
+                        meta_end_ts = pd.to_datetime(
+                            meta_end_raw, utc=True, errors="coerce"
+                        )
+                        if not pd.isna(meta_end_ts):
+                            meta_covers = (
+                                meta_end_ts.to_pydatetime() >= horizon_end
+                            )
+                    except Exception:
+                        pass
+                calendar_diagnostics["meta_covers_horizon"] = meta_covers
+
+                # --- Parse events ---
+                parsed = []
+                if isinstance(events, list) and events:
+                    for event in events:
+                        raw_time = event.get("date")
+                        if not raw_time:
+                            continue
+                        try:
+                            t = pd.to_datetime(
+                                raw_time, utc=True, errors="coerce"
+                            )
+                            if pd.isna(t):
                                 continue
-                    
-                    if valid_upcoming_events > 0:
-                        calendar_available = True
-                        if event_risk != "HIGH":
-                            event_risk = "LOW"
+                            parsed.append(
+                                {
+                                    "time": t.to_pydatetime(),
+                                    "impact": str(
+                                        event.get("impact", "")
+                                    ).strip().lower(),
+                                }
+                            )
+                        except Exception:
+                            continue
+
+                # --- Coverage proof B: structural span + density ---
+                span_covers = False
+                density_ok = False
+                if parsed:
+                    has_past = any(e["time"] <= now for e in parsed)
+                    has_future = any(e["time"] >= horizon_end for e in parsed)
+                    span_covers = has_past and has_future
+
+                    unique_days = {e["time"].date() for e in parsed}
+                    density_ok = len(unique_days) >= 2 or len(parsed) >= 3
+
+                calendar_diagnostics["span_check_passed"] = span_covers
+                calendar_diagnostics["density_check_passed"] = density_ok
+
+                # --- Decide ---
+                if meta_covers:
+                    calendar_diagnostics["coverage_evidence"] = "meta_range"
+                elif span_covers and density_ok:
+                    calendar_diagnostics["coverage_evidence"] = "structural_span"
+
+                if calendar_diagnostics["coverage_evidence"] != "none":
+                    calendar_available = True
+
+                    high_impact_found = any(
+                        e["impact"] == "high"
+                        and now <= e["time"] <= horizon_end
+                        for e in parsed
+                    )
+                    event_risk = "HIGH" if high_impact_found else "LOW"
+
+                    calendar_diagnostics["reason"] = (
+                        f"coverage proven via "
+                        f"{calendar_diagnostics['coverage_evidence']}"
+                    )
+                else:
+                    calendar_diagnostics["reason"] = (
+                        "no positive coverage evidence — "
+                        "defaulting to UNKNOWN (fail-closed)"
+                    )
+
+                if not calendar_available:
+                    logger.warning(
+                        "Calendar coverage unproven: %s",
+                        calendar_diagnostics,
+                    )
+
             except Exception:
-                pass
+                calendar_diagnostics["reason"] = "request_or_parse_failure"
+                logger.exception(
+                    "Economic calendar request failed — event risk UNKNOWN"
+                )
 
         # 3. Data Fetch
         df_eur = pd.DataFrame()
         df_dxy = pd.DataFrame()
-        
+
         if TWELVE_DATA_KEY:
             try:
                 url = f"https://api.twelvedata.com/time_series?symbol=EUR/USD&interval=1h&outputsize=1000&apikey={TWELVE_DATA_KEY}"
                 response = requests.get(url, timeout=5).json()
                 if 'values' in response:
                     df_eur = pd.DataFrame(response['values'])
-                    df_eur['datetime'] = pd.to_datetime(df_eur['datetime'], utc=True) 
+                    df_eur['datetime'] = pd.to_datetime(df_eur['datetime'], utc=True)
                     df_eur = df_eur.set_index('datetime').sort_index()
                     for col in ['open', 'high', 'low', 'close']:
                         if col in df_eur.columns:
@@ -582,8 +731,21 @@ def get_short_term_forecast(req: ShortTermRequest):
         if df_eur.empty or len(df_eur) < 200:
             raise ValueError("Data unavailable for EUR")
 
-        df_eur = df_eur.iloc[:-1].copy()
+        # --- PATCH 5 APPLIED HERE ---
+        now_utc = pd.Timestamp.now(tz="UTC")
+        current_hour_start = now_utc.floor("h")
+
+        df_eur = df_eur[
+            df_eur.index < current_hour_start
+        ].copy()
+
+        if len(df_eur) < 200:
+            raise ValueError(
+                "Insufficient completed hourly EUR/USD candles."
+            )
+
         current_price = float(df_eur['Close'].iloc[-1])
+        # ----------------------------
 
         # --- CHATGPT'S DXY PATCH 1 APPLIED HERE ---
         df_eur = df_eur[['Open', 'High', 'Low', 'Close']].rename(
@@ -649,9 +811,21 @@ def get_short_term_forecast(req: ShortTermRequest):
 
         df['Close'] = df['Close_EUR']
 
-        # MTF
-        df_h4 = df['Close'].resample('4h').last().dropna().iloc[:-1]
-        df_d1 = df['Close'].resample('1D').last().dropna().iloc[:-1]
+        # --- PATCH 7 APPLIED HERE ---
+        # Build higher-timeframe candles using completed hourly data only.
+        current_hour_start = pd.Timestamp.now(tz="UTC").floor("h")
+
+        df_h4 = df['Close'].resample('4h').last().dropna()
+        df_h4 = df_h4[
+            (df_h4.index + pd.Timedelta(hours=4)) <= current_hour_start
+        ]
+
+        df_d1 = df['Close'].resample('1D').last().dropna()
+        df_d1 = df_d1[
+            (df_d1.index + pd.Timedelta(days=1)) <= current_hour_start
+        ]
+        # ----------------------------
+
         h4_trend, d1_trend = "Unknown", "Unknown"
         if len(df_h4) > 20:
             h4_sma = df_h4.rolling(20).mean().iloc[-1]
@@ -669,7 +843,7 @@ def get_short_term_forecast(req: ShortTermRequest):
         df['Clean_Close'] = df['Close'].ewm(span=10, adjust=False).mean()
         df['ret_1h'] = df['Clean_Close'].pct_change(1)
         df['ret_24h'] = df['Clean_Close'].pct_change(24)
-        
+
         if dxy_available:
             df['Clean_DXY'] = df['Close_DXY'].ewm(
                 span=10,
@@ -677,7 +851,6 @@ def get_short_term_forecast(req: ShortTermRequest):
                 min_periods=10
             ).mean()
 
-            # Do not silently fill missing DXY observations.
             df['dxy_ret_1h'] = df['Clean_DXY'].pct_change(
                 periods=1,
                 fill_method=None
@@ -688,7 +861,6 @@ def get_short_term_forecast(req: ShortTermRequest):
                 min_periods=18
             ).corr(df['dxy_ret_1h'])
 
-            # Only retain DXY if the latest prediction features are valid.
             latest_dxy_features = df[
                 ['dxy_ret_1h', 'dxy_corr']
             ].iloc[-1]
@@ -710,14 +882,14 @@ def get_short_term_forecast(req: ShortTermRequest):
         df['trend_direction'] = np.where(df['Clean_Close'] > df['sma_50'], 1, -1)
         df['std_50'] = df['Clean_Close'].rolling(window=50).std()
         df['z_score'] = (df['Clean_Close'] - df['sma_50']) / (df['std_50'] + 1e-9)
-        
+
         df['rsi'] = calculate_wilder_rsi(df['Close'], period=14)
         df['rsi_extreme_low'] = (df['rsi'] <= 5).astype(int)
         df['rsi_extreme_high'] = (df['rsi'] >= 95).astype(int)
 
         df['atr'] = calculate_true_wilder_atr(df, window=14)
         df['adx'], df['plus_di'], df['minus_di'], df['adx_rising'] = calculate_true_wilder_adx(df)
-        
+
         current_adx = float(df['adx'].iloc[-1]) if not pd.isna(df['adx'].iloc[-1]) else 0.0
         market_regime = "Unknown"
         if current_adx > 25:
@@ -730,7 +902,7 @@ def get_short_term_forecast(req: ShortTermRequest):
         df['range_size'] = df['High'] - df['Low']
         df['range_mean'] = df['range_size'].rolling(window=24).mean()
         df['range_spike'] = np.where(df['range_size'] > (df['range_mean'] * 1.5), 1, 0)
-        
+
         df['prev_high'] = df['High'].shift(1)
         df['prev_low'] = df['Low'].shift(1)
         df['bearish_sweep'] = np.where((df['High'] > df['prev_high']) & (df['Close'] < df['prev_high']) & (df['range_spike'] == 1), -1, 0)
@@ -743,35 +915,63 @@ def get_short_term_forecast(req: ShortTermRequest):
         df['near_swing_high'] = np.where(df['Close'] > df['swing_high'] * 0.998, 1, 0)
         df['near_swing_low'] = np.where(df['Close'] < df['swing_low'] * 1.002, 1, 0)
 
-        periods_ahead = req.forecast_days * 24 
-        
+        periods_ahead = req.forecast_days * 24
+
         df['target_end_time'] = df.index.to_series().shift(-periods_ahead)
         df['target'] = np.where(
             df['Close'].shift(-periods_ahead).notna(),
             (df['Close'].shift(-periods_ahead) > df['Close']).astype(float),
             np.nan
         )
-        
-        features = ['ret_1h', 'ret_24h', 'dist_sma', 'rsi', 'rsi_extreme_low', 'rsi_extreme_high', 
+
+        features = ['ret_1h', 'ret_24h', 'dist_sma', 'rsi', 'rsi_extreme_low', 'rsi_extreme_high',
                     'range_spike', 'net_sweep', 'near_swing_high', 'near_swing_low', 'trend_direction', 'z_score']
-        
+
         if dxy_available:
             features.extend(['dxy_ret_1h', 'dxy_corr'])
-        
+
         X_live = df[features].iloc[-1:].copy()
         if X_live.isna().any().any() or not np.isfinite(X_live).all().all():
             raise ValueError("Live feature vector contains missing or non-finite values.")
 
         df_train = df.dropna(subset=features + ['target']).copy()
-        
+
+        # --- PATCH 3 APPLIED HERE ---
+        if len(df_train) < 250:
+            raise ValueError(
+                "Insufficient historical samples for reliable validation."
+            )
+
         split_idx = int(len(df_train) * 0.75)
+
+        if split_idx <= 0 or split_idx >= len(df_train):
+            raise ValueError("Invalid chronological validation split.")
+
         val_start_time = df_train.index[split_idx]
-        
-        train_df = df_train[df_train['target_end_time'] < val_start_time]
-        test_df = df_train[df_train.index >= val_start_time]
-        
+
+        train_df = df_train[
+            df_train['target_end_time'] < val_start_time
+        ].copy()
+
+        test_df = df_train[
+            df_train.index >= val_start_time
+        ].copy()
+
         if len(train_df) < 150:
-            raise ValueError("Insufficient post-purge training data.")
+            raise ValueError(
+                "Insufficient post-purge training data."
+            )
+
+        if len(test_df) < 10:
+            raise ValueError(
+                "Insufficient validation samples."
+            )
+
+        if train_df['target'].nunique() < 2:
+            raise ValueError(
+                "Training data contains only one target class."
+            )
+        # ----------------------------
 
         base_xgb = xgb.XGBClassifier(n_estimators=50, learning_rate=0.05, max_depth=3, objective='binary:logistic', eval_metric='logloss')
         base_rf = RandomForestClassifier(n_estimators=50, max_depth=4, random_state=42)
@@ -781,7 +981,9 @@ def get_short_term_forecast(req: ShortTermRequest):
 
         brier, acc, baseline_brier, baseline_acc, bss = None, None, None, None, None
         val_sample_count = len(test_df)
-        if val_sample_count > 10:
+
+        # --- PATCH 4 (FIRST REPLACEMENT) APPLIED HERE ---
+        if val_sample_count >= 100:
             test_preds = (base_xgb.predict_proba(test_df[features])[:, 1] * 0.5) + (base_rf.predict_proba(test_df[features])[:, 1] * 0.5)
             brier = float(brier_score_loss(test_df['target'], test_preds))
             acc = float(accuracy_score(test_df['target'], (test_preds > 0.5).astype(int)))
@@ -791,6 +993,7 @@ def get_short_term_forecast(req: ShortTermRequest):
             baseline_acc = float(accuracy_score(test_df['target'], (baseline_preds > 0.5).astype(int)))
             if baseline_brier > 0:
                 bss = float(1.0 - (brier / baseline_brier))
+        # ---------------------------------------------------
 
         final_xgb = xgb.XGBClassifier(n_estimators=50, learning_rate=0.05, max_depth=3, objective='binary:logistic', eval_metric='logloss')
         final_rf = RandomForestClassifier(n_estimators=50, max_depth=4, random_state=42)
@@ -803,9 +1006,9 @@ def get_short_term_forecast(req: ShortTermRequest):
         model_disagreement = float(abs(p_up_xgb - p_up_rf))
 
         current_atr = float(df['atr'].iloc[-1]) if not pd.isna(df['atr'].iloc[-1]) else None
-        
+
         if current_atr is None or not np.isfinite(current_atr) or current_atr <= 0:
-            fallback_tr = (df['High'] - df['Low']).tail(14).mean() 
+            fallback_tr = (df['High'] - df['Low']).tail(14).mean()
             if not np.isfinite(fallback_tr) or fallback_tr <= 0:
                 raise ValueError("Invalid ATR and fallback. Forecast aborted.")
             current_atr = fallback_tr
@@ -817,11 +1020,18 @@ def get_short_term_forecast(req: ShortTermRequest):
         current_minus_di = float(df['minus_di'].iloc[-1]) if not pd.isna(df['minus_di'].iloc[-1]) else 0.0
         adx_is_rising = bool(df['adx_rising'].iloc[-1]) if not pd.isna(df['adx_rising'].iloc[-1]) else False
 
-        SPREAD_PIPS = 0.00015 
-        expected_move = current_atr * 1.5 
-        
-        validation_pass = (bss is not None and bss > 0.0 and val_sample_count >= 10)
-        
+        SPREAD_PIPS = 0.00015
+        expected_move = current_atr * 1.5
+
+        # --- PATCH 4 (SECOND REPLACEMENT) APPLIED HERE ---
+        validation_pass = (
+            bss is not None
+            and bss > 0.0
+            and val_sample_count >= 100
+            and test_df['target'].nunique() >= 2
+        )
+        # -------------------------------------------------
+
         raw_signal = "HOLD"
         if validation_pass and macro_available and market_regime != "Unknown" and calendar_available and event_risk == "LOW" and expected_move > SPREAD_PIPS:
             if p_up_pure > 0.60: raw_signal = "BUY"
@@ -835,12 +1045,12 @@ def get_short_term_forecast(req: ShortTermRequest):
                 signal = "HOLD"
 
         if signal == "SELL":
-            if current_trend == 1 or current_z < -2.5: signal = "HOLD" 
+            if current_trend == 1 or current_z < -2.5: signal = "HOLD"
         elif signal == "BUY":
-            if current_trend == -1 or current_z > 2.5: signal = "HOLD" 
+            if current_trend == -1 or current_z > 2.5: signal = "HOLD"
 
         if signal == "BUY":
-            target_price = current_price + (3.0 * current_atr) 
+            target_price = current_price + (3.0 * current_atr)
             stop_loss = current_price - (1.5 * current_atr)
         elif signal == "SELL":
             target_price = current_price - (3.0 * current_atr)
@@ -860,13 +1070,13 @@ def get_short_term_forecast(req: ShortTermRequest):
         save_journal_record(journal_record)
 
         last_signal = get_last_signal()
-        
+
         if signal != last_signal:
             if signal in ["BUY", "SELL"]:
                 tp_str = f"{target_price:.5f}" if target_price is not None else "N/A"
                 sl_str = f"{stop_loss:.5f}" if stop_loss is not None else "N/A"
                 bss_str = f"{bss*100:.1f}%" if bss is not None else "N/A"
-                
+
                 alert_msg = (
                     f"🚨 *NEW {signal} SIGNAL* 🚨\n\n"
                     f"💵 *Asset:* EUR/USD\n"
@@ -879,9 +1089,10 @@ def get_short_term_forecast(req: ShortTermRequest):
                 send_telegram_alert(alert_msg)
             elif signal == "HOLD" and last_signal in ["BUY", "SELL"]:
                 send_telegram_alert(f"🔔 *Trade Closed / Signal Faded* 🔔\nEUR/USD is now back to HOLD.")
-            
+
             update_last_signal(signal)
 
+        # --- PATCH 6 APPLIED HERE ---
         raw_response = {
             "current_price": current_price,
             "forecast_days": req.forecast_days,
@@ -906,6 +1117,7 @@ def get_short_term_forecast(req: ShortTermRequest):
             "minus_di": current_minus_di,
             "adx_rising": adx_is_rising,
             "calendar_available": calendar_available,
+            "calendar_diagnostics": calendar_diagnostics,
             "target_price": target_price,
             "stop_loss": stop_loss,
             "last_rsi": float(current_rsi),
@@ -923,10 +1135,12 @@ def get_short_term_forecast(req: ShortTermRequest):
             "forecast_horizon_requested_days": req.forecast_days,
             "atr_value": current_atr,
             "history": history,
+            "validation_pass": validation_pass,
             "forecast_valid": True,
-            "response_state": "normal"
+            "response_state": "normal" if validation_pass else "validation_failed"
         }
-        
+        # ----------------------------
+
         return {"status": "success", "data": adapt_for_flutter(raw_response)}
 
     except Exception as e:
@@ -942,7 +1156,14 @@ def get_short_term_forecast(req: ShortTermRequest):
             "horizon_conflict": "Unknown", "mtf_trend": "Unknown",
             "market_regime": "Unknown", "adx_value": None,
             "plus_di": None, "minus_di": None, "adx_rising": False,
-            "calendar_available": False, "target_price": None, "stop_loss": None,
+            "calendar_available": False,
+            "calendar_diagnostics": {
+                "response_received": False, "events_returned": 0,
+                "meta_present": False, "meta_covers_horizon": False,
+                "span_check_passed": False, "density_check_passed": False,
+                "coverage_evidence": "none", "reason": "fallback_path"
+            },
+            "target_price": None, "stop_loss": None,
             "last_rsi": 0.0, "macro_bias": "Unavailable", "whale_trap_detected": False,
             "event_risk": "UNKNOWN", "dxy_available": False, "dxy_correlation": None,
             "trend_direction": "Unknown", "estimated_zscore_half_life_hours": None,
@@ -950,6 +1171,7 @@ def get_short_term_forecast(req: ShortTermRequest):
             "forecast_horizon_type": "trading_candles", "forecast_horizon_candles": req.forecast_days * 24,
             "forecast_horizon_requested_days": req.forecast_days, "atr_value": 0.0,
             "history": [],
+            "validation_pass": False,
             "forecast_valid": False,
             "response_state": "degraded",
             "error_code": "CALCULATION_ERROR"

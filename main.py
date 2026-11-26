@@ -1192,3 +1192,21 @@ def export_journal():
 @app.post("/backtest")
 def backtest(req: ShortTermRequest):
     return {"status": "success", "message": "Backtest endpoint placeholder. Awaiting full chronological engine."}
+
+
+@app.get("/diagnostics/calendar")
+def get_calendar_diagnostic():
+    """Exposes the captured calendar sample to the browser for mobile inspection."""
+    SAMPLE_FILE = "calendar_response_sample.json"
+    if os.path.exists(SAMPLE_FILE):
+        try:
+            with open(SAMPLE_FILE, "r") as f:
+                data = json.load(f)
+            return {"status": "success", "data": data}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to read diagnostic file: {e}")
+    else:
+        raise HTTPException(
+            status_code=404, 
+            detail="Diagnostic file not found. Please call /short_term_forecast at least once to trigger a calendar fetch."
+        )

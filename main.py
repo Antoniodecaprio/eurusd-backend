@@ -795,7 +795,7 @@ def get_short_term_forecast(req: ShortTermRequest):
             "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "spot": current_price, "prob_up": round(p_up_pure, 4), "signal": signal,
             "target": round(target_price, 5) if target_price else None, "stop": round(stop_loss, 5) if stop_loss else None,
-            "mtf_trend": mtf_alignment, "regime": market_regime, "adx": round(current_adx, 2)
+            "mtf_trend": mtf_alignment, "regime": market_regime, "adx": round(current_adx, 2), "forecast_days": req.forecast_days
         }
         log_forecast_to_csv(journal_record)
 

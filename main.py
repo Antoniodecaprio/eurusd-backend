@@ -797,7 +797,7 @@ def get_short_term_forecast(req: ShortTermRequest):
             "target": round(target_price, 5) if target_price else None, "stop": round(stop_loss, 5) if stop_loss else None,
             "mtf_trend": mtf_alignment, "regime": market_regime, "adx": round(current_adx, 2), "forecast_days": req.forecast_days
         }
-        log_forecast_to_csv(journal_record)
+        save_journal_record(journal_record)
 
         # --- NEW: TELEGRAM NOTIFICATION LOGIC ---
         last_signal = get_last_signal()

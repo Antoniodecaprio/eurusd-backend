@@ -514,7 +514,7 @@ def get_short_term_forecast(req: ShortTermRequest):
         except Exception:
             pass
 
-        # 2. Economic Calendar — fail-closed until coverage is proven
+        # 2. Economic Calendar
         event_risk = "UNKNOWN"
         calendar_available = False
 
@@ -1113,7 +1113,7 @@ def get_short_term_forecast(req: ShortTermRequest):
             "atr_value": current_atr,
             "history": history,
             "validation_pass": validation_pass,
-            "forecast_valid": True,
+            "forecast_valid": validation_pass,
             "response_state": "normal" if validation_pass else "validation_failed"
         }
         # ----------------------------

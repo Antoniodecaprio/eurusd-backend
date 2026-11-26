@@ -515,14 +515,6 @@ def get_short_term_forecast(req: ShortTermRequest):
             pass
 
         # 2. Economic Calendar — fail-closed until coverage is proven
-        #
-        # Coverage is only claimed if we have POSITIVE evidence:
-        #   (A) explicit meta range with end_date >= horizon_end, OR
-        #   (B) structural span: at least one event <= now AND one >= horizon_end,
-        #       plus density >= 2 distinct days (rejects single-cluster payloads)
-        #
-        # Absent (A) or (B), event_risk stays UNKNOWN and the signal gate blocks.
-
         event_risk = "UNKNOWN"
         calendar_available = False
 
@@ -539,13 +531,37 @@ def get_short_term_forecast(req: ShortTermRequest):
 
         if TWELVE_DATA_KEY:
             try:
-                cal_url = (
-                    "https://api.twelvedata.com/economic_calendar"
-                    f"?country=US,EZ&apikey={TWELVE_DATA_KEY}"
-                )
-                cal_response = requests.get(cal_url, timeout=5)
+                # Use requests params for safe URL encoding
+                cal_url = "https://api.twelvedata.com/economic_calendar"
+                cal_params = {
+                    "country": "United States,Euro Area",
+                    "apikey": TWELVE_DATA_KEY
+                }
+                cal_response = requests.get(cal_url, params=cal_params, timeout=5)
+                
+                try:
+                    cal_res = cal_response.json()
+                except Exception:
+                    cal_res = {"raw_text": cal_response.text}
+
+                # --- Force diagnostic capture BEFORE raising status ---
+                SAMPLE_FILE = "calendar_response_sample.json"
+                try:
+                    with open(SAMPLE_FILE, "w") as f:
+                        json.dump(
+                            {
+                                "status_code": cal_response.status_code,
+                                "request_url_redacted": cal_response.url.replace(TWELVE_DATA_KEY, "***"),
+                                "response_body": cal_res,
+                            },
+                            f,
+                            indent=2,
+                            default=str,
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to write diagnostic file: {e}")
+
                 cal_response.raise_for_status()
-                cal_res = cal_response.json()
                 calendar_diagnostics["response_received"] = True
 
                 now = datetime.datetime.now(datetime.timezone.utc)
@@ -562,45 +578,6 @@ def get_short_term_forecast(req: ShortTermRequest):
                 calendar_diagnostics["events_returned"] = (
                     len(events) if isinstance(events, list) else 0
                 )
-
-                # --- One-time diagnostic capture of the real payload ---
-                SAMPLE_FILE = "calendar_response_sample.json"
-                if (
-                    not os.path.exists(SAMPLE_FILE)
-                    and (calendar_diagnostics["events_returned"] > 0 or meta)
-                ):
-                    try:
-                        with open(SAMPLE_FILE, "w") as f:
-                            json.dump(
-                                {
-                                    "captured_at": now.isoformat(),
-                                    "request_url_redacted": cal_url.replace(
-                                        TWELVE_DATA_KEY, "***"
-                                    ),
-                                    "forecast_days": req.forecast_days,
-                                    "horizon_end": horizon_end.isoformat(),
-                                    "top_level_keys": list(cal_res.keys()),
-                                    "meta_keys": list(meta.keys()) if meta else [],
-                                    "sample_events": (
-                                        events[:3]
-                                        if isinstance(events, list)
-                                        else []
-                                    ),
-                                    "full_response": cal_res,
-                                },
-                                f,
-                                indent=2,
-                                default=str,
-                            )
-                        logger.info(
-                            f"Wrote {SAMPLE_FILE} — inspect this to verify "
-                            f"Twelve Data coverage fields."
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Failed to write calendar diagnostic sample",
-                            exc_info=True,
-                        )
 
                 # --- Coverage proof A: explicit meta range ---
                 meta_covers = False
@@ -1192,7 +1169,6 @@ def export_journal():
 @app.post("/backtest")
 def backtest(req: ShortTermRequest):
     return {"status": "success", "message": "Backtest endpoint placeholder. Awaiting full chronological engine."}
-
 
 @app.get("/diagnostics/calendar")
 def get_calendar_diagnostic():

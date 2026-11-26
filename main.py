@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 warnings.filterwarnings('ignore')
 
-app = FastAPI(title="EUR/USD Quant Forecaster", version="4.3.1")
+app = FastAPI(title="EUR/USD Quant Forecaster", version="4.3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -436,7 +436,7 @@ def build_journal_csv_response(rows):
 
 @app.get("/")
 def read_root():
-    return {"status": "API is running - Quant v4.3.1"}
+    return {"status": "API is running - Quant v4.3.2"}
 
 @app.post("/forecast")
 def get_forecast(req: ForecastRequest):
@@ -585,7 +585,7 @@ def get_short_term_forecast(req: ShortTermRequest):
         df_eur = df_eur.iloc[:-1].copy()
         current_price = float(df_eur['Close'].iloc[-1])
 
-        # --- CHATGPT'S DXY PATCH APPLIED HERE ---
+        # --- CHATGPT'S DXY PATCH 1 APPLIED HERE ---
         df_eur = df_eur[['Open', 'High', 'Low', 'Close']].rename(
             columns={'Close': 'Close_EUR'}
         ).sort_index()
@@ -665,18 +665,45 @@ def get_short_term_forecast(req: ShortTermRequest):
             elif h4_trend == "Down" and d1_trend == "Down": mtf_alignment = "Strong Bearish"
             else: mtf_alignment = "Conflict"
 
-        # Features
+        # --- CHATGPT'S DXY PATCH 2 APPLIED HERE ---
         df['Clean_Close'] = df['Close'].ewm(span=10, adjust=False).mean()
         df['ret_1h'] = df['Clean_Close'].pct_change(1)
         df['ret_24h'] = df['Clean_Close'].pct_change(24)
         
         if dxy_available:
-            df['Clean_DXY'] = df['Close_DXY'].ewm(span=10, adjust=False).mean()
-            df['dxy_ret_1h'] = df['Clean_DXY'].pct_change(1)
-            df['dxy_corr'] = df['ret_1h'].rolling(24).corr(df['dxy_ret_1h'])
-        else:
+            df['Clean_DXY'] = df['Close_DXY'].ewm(
+                span=10,
+                adjust=False,
+                min_periods=10
+            ).mean()
+
+            # Do not silently fill missing DXY observations.
+            df['dxy_ret_1h'] = df['Clean_DXY'].pct_change(
+                periods=1,
+                fill_method=None
+            )
+
+            df['dxy_corr'] = df['ret_1h'].rolling(
+                window=24,
+                min_periods=18
+            ).corr(df['dxy_ret_1h'])
+
+            # Only retain DXY if the latest prediction features are valid.
+            latest_dxy_features = df[
+                ['dxy_ret_1h', 'dxy_corr']
+            ].iloc[-1]
+
+            if not np.isfinite(latest_dxy_features).all():
+                logger.warning(
+                    "Latest DXY features are incomplete. "
+                    "Disabling DXY for this forecast."
+                )
+                dxy_available = False
+
+        if not dxy_available:
             df['dxy_ret_1h'] = 0.0
             df['dxy_corr'] = 0.0
+        # ------------------------------------------
 
         df['sma_50'] = df['Clean_Close'].rolling(window=50).mean()
         df['dist_sma'] = (df['Clean_Close'] - df['sma_50']) / df['sma_50']

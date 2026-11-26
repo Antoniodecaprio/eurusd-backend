@@ -19,7 +19,6 @@ import logging
 import csv
 import io
 import json  
-# <-- NEW: For state management
 from statsmodels.tsa.stattools import adfuller
 from functools import lru_cache
 
@@ -27,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 warnings.filterwarnings('ignore')
 
-app = FastAPI(title="EUR/USD Quant Forecaster", version="4.3.0")
+app = FastAPI(title="EUR/USD Quant Forecaster", version="4.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,8 +38,8 @@ app.add_middleware(
 
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") # <-- NEW
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")     # <-- NEW
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") 
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")     
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -52,7 +51,7 @@ JOURNAL_LEGACY_FIELDS = [
 ]
 
 JOURNAL_FILE = "forecast_journal.csv"
-STATE_FILE = "last_signal_state.json"                # <-- NEW
+STATE_FILE = "last_signal_state.json"                
 
 class ShortTermRequest(BaseModel):
     forecast_days: int = Field(default=3, ge=1, le=7)
@@ -279,11 +278,8 @@ def log_forecast_to_csv(record):
     except Exception as e:
         logger.error(f"Failed to write to journal: {e}")
 
-
-
 def _supabase_is_configured():
     return bool(SUPABASE_URL and SUPABASE_KEY)
-
 
 def _supabase_headers(prefer=None):
     headers = {
@@ -295,9 +291,7 @@ def _supabase_headers(prefer=None):
         headers["Prefer"] = prefer
     return headers
 
-
 def _legacy_row_from_supabase(row):
-    """Translate database column names back to the old FlutterFlow journal schema."""
     spot = row.get("spot_price")
     if spot is None:
         spot = row.get("current_price")
@@ -322,7 +316,6 @@ def _legacy_row_from_supabase(row):
         for key, value in legacy.items()
     }
 
-
 def _read_local_journal():
     if not os.path.isfile(JOURNAL_FILE):
         return []
@@ -336,7 +329,6 @@ def _read_local_journal():
     except Exception:
         logger.exception("Failed to read local CSV journal")
         return []
-
 
 def _fetch_supabase_journal(limit=20, offset=0, order="timestamp.desc"):
     url = f"{SUPABASE_URL}/rest/v1/forecast_journal"
@@ -357,7 +349,6 @@ def _fetch_supabase_journal(limit=20, offset=0, order="timestamp.desc"):
     if not isinstance(payload, list):
         raise ValueError("Unexpected Supabase journal response")
     return payload
-
 
 def save_journal_record(record):
     """Write to Supabase; preserve a local CSV fallback if that fails."""
@@ -396,7 +387,6 @@ def save_journal_record(record):
 
     log_forecast_to_csv(record)
 
-
 def get_journal_rows(limit=None):
     """Return legacy-shaped journal rows, oldest first."""
     if _supabase_is_configured():
@@ -428,7 +418,6 @@ def get_journal_rows(limit=None):
     rows = _read_local_journal()
     return rows[-limit:] if limit is not None else rows
 
-
 def build_journal_csv_response(rows):
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=JOURNAL_LEGACY_FIELDS)
@@ -441,14 +430,13 @@ def build_journal_csv_response(rows):
         headers={"Content-Disposition": 'attachment; filename="forecast_journal_backup.csv"'},
     )
 
-
 # ==========================================
-# MACRO ENDPOINT
+# ENDPOINTS
 # ==========================================
 
 @app.get("/")
 def read_root():
-    return {"status": "API is running - Quant v4.3"}
+    return {"status": "API is running - Quant v4.3.1"}
 
 @app.post("/forecast")
 def get_forecast(req: ForecastRequest):
@@ -508,10 +496,6 @@ def get_forecast(req: ForecastRequest):
         logger.exception("Macro Forecast Error")
         raise HTTPException(status_code=500, detail={"status": "error", "message": "Internal calculation error"})
 
-# ==========================================
-# MICRO ENDPOINT (SHORT-TERM ML)
-# ==========================================
-
 @app.post("/short_term_forecast")
 def get_short_term_forecast(req: ShortTermRequest):
     try:
@@ -530,7 +514,7 @@ def get_short_term_forecast(req: ShortTermRequest):
         except Exception:
             pass
 
-        # 2. Calendar (Fixed logic)
+        # 2. Calendar
         event_risk = "UNKNOWN"
         calendar_available = False
         if TWELVE_DATA_KEY:
@@ -598,19 +582,72 @@ def get_short_term_forecast(req: ShortTermRequest):
         if df_eur.empty or len(df_eur) < 200:
             raise ValueError("Data unavailable for EUR")
 
-        dxy_available = not df_dxy.empty
-        
-        df_eur = df_eur[['Open', 'High', 'Low', 'Close']].rename(columns={'Close': 'Close_EUR'})
-        
-        df = df_eur.copy()
-        if dxy_available:
-            df_dxy = df_dxy[['Close']].rename(columns={'Close': 'Close_DXY'})
-            df = df_eur.join(df_dxy, how='left')
-            df['Close_DXY'] = df['Close_DXY'].ffill(limit=4)
+        df_eur = df_eur.iloc[:-1].copy()
+        current_price = float(df_eur['Close'].iloc[-1])
 
-        df = df.iloc[:-1].copy()
+        # --- CHATGPT'S DXY PATCH APPLIED HERE ---
+        df_eur = df_eur[['Open', 'High', 'Low', 'Close']].rename(
+            columns={'Close': 'Close_EUR'}
+        ).sort_index()
+
+        df_eur = df_eur[~df_eur.index.duplicated(keep='last')]
+        df_eur.index.name = 'datetime'
+
+        df = df_eur.copy()
+        dxy_available = False
+
+        if not df_dxy.empty:
+            try:
+                df_dxy = df_dxy[['Close']].rename(
+                    columns={'Close': 'Close_DXY'}
+                ).sort_index()
+
+                df_dxy = df_dxy[~df_dxy.index.duplicated(keep='last')]
+                df_dxy.index.name = 'datetime'
+
+                left = df_eur.reset_index().sort_values('datetime')
+                right = df_dxy.reset_index().sort_values('datetime')
+
+                merged = pd.merge_asof(
+                    left,
+                    right,
+                    on='datetime',
+                    direction='backward',
+                    tolerance=pd.Timedelta('2h')
+                )
+
+                df = merged.set_index('datetime')
+
+                matched_count = int(df['Close_DXY'].notna().sum())
+                minimum_matches = max(100, int(len(df) * 0.30))
+
+                latest_dxy_time = df['Close_DXY'].last_valid_index()
+
+                latest_dxy_age = (
+                    df.index[-1] - latest_dxy_time
+                    if latest_dxy_time is not None
+                    else pd.Timedelta.max
+                )
+
+                dxy_available = (
+                    matched_count >= minimum_matches
+                    and latest_dxy_age <= pd.Timedelta('2h')
+                )
+
+                if not dxy_available:
+                    logger.warning(
+                        "DXY data rejected: insufficient matched coverage "
+                        "or latest observation is stale."
+                    )
+                    df = df_eur.copy()
+
+            except Exception:
+                logger.exception("DXY alignment failed; continuing without DXY.")
+                df = df_eur.copy()
+                dxy_available = False
+        # ---------------------------------------
+
         df['Close'] = df['Close_EUR']
-        current_price = float(df['Close'].iloc[-1])
 
         # MTF
         df_h4 = df['Close'].resample('4h').last().dropna().iloc[:-1]
@@ -715,7 +752,6 @@ def get_short_term_forecast(req: ShortTermRequest):
         base_xgb.fit(train_df[features], train_df['target'])
         base_rf.fit(train_df[features], train_df['target'])
 
-        # Validation Metrics
         brier, acc, baseline_brier, baseline_acc, bss = None, None, None, None, None
         val_sample_count = len(test_df)
         if val_sample_count > 10:
@@ -729,7 +765,6 @@ def get_short_term_forecast(req: ShortTermRequest):
             if baseline_brier > 0:
                 bss = float(1.0 - (brier / baseline_brier))
 
-        # Deploy Models
         final_xgb = xgb.XGBClassifier(n_estimators=50, learning_rate=0.05, max_depth=3, objective='binary:logistic', eval_metric='logloss')
         final_rf = RandomForestClassifier(n_estimators=50, max_depth=4, random_state=42)
         final_xgb.fit(df_train[features], df_train['target'])
@@ -742,7 +777,6 @@ def get_short_term_forecast(req: ShortTermRequest):
 
         current_atr = float(df['atr'].iloc[-1]) if not pd.isna(df['atr'].iloc[-1]) else None
         
-        # FIXED: Strict ATR Guardrail
         if current_atr is None or not np.isfinite(current_atr) or current_atr <= 0:
             fallback_tr = (df['High'] - df['Low']).tail(14).mean() 
             if not np.isfinite(fallback_tr) or fallback_tr <= 0:
@@ -759,7 +793,6 @@ def get_short_term_forecast(req: ShortTermRequest):
         SPREAD_PIPS = 0.00015 
         expected_move = current_atr * 1.5 
         
-        # FIXED: BSS is now used as a validation gate
         validation_pass = (bss is not None and bss > 0.0 and val_sample_count >= 10)
         
         raw_signal = "HOLD"
@@ -799,12 +832,10 @@ def get_short_term_forecast(req: ShortTermRequest):
         }
         save_journal_record(journal_record)
 
-        # --- NEW: TELEGRAM NOTIFICATION LOGIC ---
         last_signal = get_last_signal()
         
         if signal != last_signal:
             if signal in ["BUY", "SELL"]:
-                # Safely format numbers to avoid crashes
                 tp_str = f"{target_price:.5f}" if target_price is not None else "N/A"
                 sl_str = f"{stop_loss:.5f}" if stop_loss is not None else "N/A"
                 bss_str = f"{bss*100:.1f}%" if bss is not None else "N/A"
@@ -823,7 +854,6 @@ def get_short_term_forecast(req: ShortTermRequest):
                 send_telegram_alert(f"🔔 *Trade Closed / Signal Faded* 🔔\nEUR/USD is now back to HOLD.")
             
             update_last_signal(signal)
-        # ----------------------------------------
 
         raw_response = {
             "current_price": current_price,

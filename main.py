@@ -901,15 +901,7 @@ def get_short_term_forecast(req: ShortTermRequest):
 
 @app.get("/journal")
 def get_journal():
-    if not os.path.isfile(JOURNAL_FILE):
-        return {"status": "success", "journal": []}
-    try:
-        with open(JOURNAL_FILE, mode='r') as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
-            return {"status": "success", "journal": rows[-20:]}
-    except Exception:
-        return {"status": "success", "journal": []}
+    return {"status": "success", "journal": get_journal_rows(limit=20)}
 
 @app.get("/export_journal")
 def export_journal():

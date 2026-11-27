@@ -115,6 +115,7 @@ def market_quality():
         # fields without returning any candle arrays.
         summary[timeframe] = {
             "status": item.get("status", "unknown"),
+            "source": quality.get("source", metadata.get("source", "unknown")),
             "candle_count": quality.get("candle_count"),
             "last_candle_close_utc": quality.get("last_candle_close_utc"),
             "age_seconds": quality.get("age_seconds"),

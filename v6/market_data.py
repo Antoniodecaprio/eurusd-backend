@@ -21,7 +21,7 @@ SOURCE = "Yahoo Finance (yfinance)"
 # Short-lived process cache reduces duplicate provider calls and softens rate limits.
 _CACHE_TTL_SECONDS = {"15m": 60, "60m": 300, "1d": 3600}
 _cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
-_rate_limited_until = 0.0
+_rate_limited_until: dict[tuple[str, str], float] = {}
 _cache_lock = Lock()
 INTERVALS = {
     "M15": ("15m", "60d"),
@@ -36,14 +36,13 @@ class MarketDataError(RuntimeError):
 
 def _download(interval: str, period: str) -> pd.DataFrame:
     """Download with a small in-process cache and rate-limit cooldown."""
-    global _rate_limited_until
     key = (interval, period)
     now_mono = monotonic()
     with _cache_lock:
         cached = _cache.get(key)
         if cached and now_mono - cached[0] <= _CACHE_TTL_SECONDS.get(interval, 60):
             return cached[1].copy()
-        if now_mono < _rate_limited_until:
+        if now_mono < _rate_limited_until.get(key, 0.0):
             if cached:
                 return cached[1].copy()
             raise MarketDataError(f"{SOURCE} rate-limit cooldown active for {interval}")
@@ -60,7 +59,7 @@ def _download(interval: str, period: str) -> pd.DataFrame:
         name = type(exc).__name__
         if "RateLimit" in name or "TooManyRequests" in name:
             with _cache_lock:
-                _rate_limited_until = monotonic() + 120
+                _rate_limited_until[key] = monotonic() + 120
                 cached = _cache.get(key)
             if cached:
                 return cached[1].copy()
@@ -69,7 +68,7 @@ def _download(interval: str, period: str) -> pd.DataFrame:
         raise MarketDataError(f"{SOURCE} returned no {interval} candles")
     with _cache_lock:
         _cache[key] = (monotonic(), frame.copy())
-        _rate_limited_until = 0.0
+        _rate_limited_until.pop(key, None)
     return frame
 
 

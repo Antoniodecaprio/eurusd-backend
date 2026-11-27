@@ -23,7 +23,7 @@ jobs:
       - name: Install backend dependencies
         run: python -m pip install -r requirements.txt
       - name: Compile backend and tests
-        run: python -m compileall -q main.py main_v5_3.py tests
+        run: python -m compileall -q main.py main_v5_3.py v6 tests
       - name: Import both FastAPI applications
         run: python -c "import main; import main_v5_3; print('Both FastAPI applications imported successfully')"
       - name: Run safety regression tests

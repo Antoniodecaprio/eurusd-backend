@@ -27,6 +27,19 @@ TIMEFRAME_PIPS = 0.0001
 PROVIDER_DEVIATION_TOLERANCE_PIPS = {"M15": 0.5, "H1": 1.0}
 
 
+def _deviation_tolerance(timeframe: str) -> float:
+    """Read a non-negative per-timeframe override, falling back to safe defaults."""
+    default = PROVIDER_DEVIATION_TOLERANCE_PIPS[timeframe]
+    raw = os.getenv(f"EURUSD_PROVIDER_TOLERANCE_{timeframe}_PIPS", "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if pd.notna(value) and value >= 0 and value != float("inf") else default
+
+
 def _observations(frame: pd.DataFrame, timeframe: str, provider: str,
                   now: pd.Timestamp) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     clean, quality = normalise_candles(
@@ -94,7 +107,7 @@ def compare_provider_frames(twelve_frame: pd.DataFrame | None,
         latest = common[-1]
         latest_diff = abs(left[latest]["close"] - right[latest]["close"]) / TIMEFRAME_PIPS
 
-    tolerance = PROVIDER_DEVIATION_TOLERANCE_PIPS[tf]
+    tolerance = _deviation_tolerance(tf)
     deviation_status = (
         "not_comparable" if latest_diff is None else
         "within_tolerance" if latest_diff <= tolerance else
@@ -121,7 +134,7 @@ def compare_provider_frames(twelve_frame: pd.DataFrame | None,
             "deviation_tolerance_pips": tolerance if latest_diff is not None else None,
             "deviation_status": deviation_status,
             "deviation_tolerance_note": (
-                "Provisional configurable research threshold; exceeding it flags "
+                "Provisional environment-configurable research threshold; exceeding it flags "
                 "provider disagreement but does not reject either feed."
             ),
             "consensus_close": None,

@@ -80,8 +80,10 @@ def compare_provider_frames(twelve_frame: pd.DataFrame | None,
     current = current.tz_localize("UTC") if current.tzinfo is None else current.tz_convert("UTC")
 
     providers: dict[str, dict[str, Any]] = {}
+    full_rows: dict[str, list[dict[str, Any]]] = {}
     for name, frame in (("Twelve Data", twelve_frame), ("Yahoo Finance", yahoo_frame)):
         if frame is None or frame.empty:
+            full_rows[name] = []
             providers[name] = {
                 "status": "unavailable", "observations": [],
                 "total_observations": 0, "observations_returned": 0,
@@ -91,6 +93,7 @@ def compare_provider_frames(twelve_frame: pd.DataFrame | None,
             continue
         try:
             rows, quality = _observations(frame, tf, name, current)
+            full_rows[name] = rows
             total_observations = len(rows)
             returned_rows = rows[-MAX_RETURNED_OBSERVATIONS:]
             providers[name] = {
@@ -103,6 +106,7 @@ def compare_provider_frames(twelve_frame: pd.DataFrame | None,
                 "error": None if rows else "No completed valid candles",
             }
         except Exception as exc:
+            full_rows[name] = []
             providers[name] = {
                 "status": "unavailable", "observations": [],
                 "total_observations": 0, "observations_returned": 0,
@@ -111,15 +115,6 @@ def compare_provider_frames(twelve_frame: pd.DataFrame | None,
             }
 
     # Compare the complete cleaned series, not the mobile response excerpts.
-    full_rows = {}
-    for name, frame in (("Twelve Data", twelve_frame), ("Yahoo Finance", yahoo_frame)):
-        if frame is None or frame.empty:
-            full_rows[name] = []
-            continue
-        try:
-            full_rows[name], _ = _observations(frame, tf, name, current)
-        except Exception:
-            full_rows[name] = []
     left = {row["candle_open_utc"]: row for row in full_rows["Twelve Data"]}
     right = {row["candle_open_utc"]: row for row in full_rows["Yahoo Finance"]}
     common = sorted(set(left).intersection(right))

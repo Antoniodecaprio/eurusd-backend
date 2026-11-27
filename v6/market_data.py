@@ -6,6 +6,7 @@ Do not use it to calculate final MT5 entry prices, spread, pip value or fills.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from threading import Lock
 from time import monotonic
 from typing import Any

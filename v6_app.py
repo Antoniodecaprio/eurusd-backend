@@ -121,6 +121,7 @@ def market_quality():
             "age_seconds": quality.get("age_seconds"),
             "stale": quality.get("stale"),
             "missing_interval_count": quality.get("missing_interval_count"),
+            "missing_interval_interpretation": quality.get("missing_interval_interpretation"),
             "duplicate_count": quality.get("duplicate_count"),
             "invalid_count": quality.get("invalid_count"),
             "ready": quality.get("ready"),

@@ -90,9 +90,10 @@ def normalise_candles(
         return empty, quality
 
     data = frame.copy()
-    data.columns = [str(col).strip().lower() for col in data.columns]
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = [str(col[-1]).strip().lower() for col in data.columns]
+    else:
+        data.columns = [str(col).strip().lower() for col in data.columns]
     missing = [col for col in REQUIRED_OHLC if col not in data.columns]
     if missing:
         raise ValueError("Missing OHLC columns: " + ", ".join(missing))

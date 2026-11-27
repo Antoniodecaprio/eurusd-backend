@@ -150,5 +150,26 @@ class ProviderComparisonTests(unittest.TestCase):
         self.assertEqual(result["comparison"]["deviation_status"], "not_comparable")
         self.assertIsNone(result["comparison"]["deviation_tolerance_pips"])
 
+
+    def test_environment_tolerance_override_is_used(self):
+        starts = pd.date_range("2026-11-27T08:00:00Z", periods=4, freq="15min")
+        with patch.dict("os.environ", {"EURUSD_PROVIDER_TOLERANCE_M15_PIPS": "0.7"}):
+            result = compare_provider_frames(
+                self.frame(starts), self.frame(starts, [1.10006] * 4), "M15",
+                now=pd.Timestamp("2026-11-27T09:05:00Z"),
+            )
+        self.assertEqual(result["comparison"]["deviation_tolerance_pips"], 0.7)
+        self.assertEqual(result["comparison"]["deviation_status"], "within_tolerance")
+
+    def test_invalid_environment_tolerance_uses_default(self):
+        starts = pd.date_range("2026-11-27T08:00:00Z", periods=4, freq="15min")
+        with patch.dict("os.environ", {"EURUSD_PROVIDER_TOLERANCE_M15_PIPS": "not-a-number"}):
+            result = compare_provider_frames(
+                self.frame(starts), self.frame(starts, [1.10006] * 4), "M15",
+                now=pd.Timestamp("2026-11-27T09:05:00Z"),
+            )
+        self.assertEqual(result["comparison"]["deviation_tolerance_pips"], 0.5)
+        self.assertEqual(result["comparison"]["deviation_status"], "above_tolerance")
+
 if __name__ == "__main__":
     unittest.main()

@@ -1232,8 +1232,10 @@ def get_showmytrades_calendar(days: int) -> dict[str, Any]:
             "documentation": "https://showmytrades.com/docs/api/economic-calendar",
         }
 
+    # Do not let a transient provider outage poison the normal 15-minute cache.
+    cache_minutes = CALENDAR_CACHE_MINUTES if result.get("status") == "available" else 1
     _calendar_cache.update({
-        "expires": now + timedelta(minutes=CALENDAR_CACHE_MINUTES),
+        "expires": now + timedelta(minutes=cache_minutes),
         "result": result,
         "forecast_days": days,
     })

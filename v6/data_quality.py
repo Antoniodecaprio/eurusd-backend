@@ -55,9 +55,7 @@ class DataQuality:
             "invalid_count": self.invalid_count,
             "missing_interval_count": self.missing_interval_count,
             "missing_interval_interpretation": (
-                "Raw elapsed-time gaps; not session-aware, so weekends and market closures may be counted."
-                if self.timeframe == "D1"
-                else "Raw elapsed-time gaps; FX market closures and provider/session gaps may be counted."
+                "Raw elapsed-time gaps; not session-aware, so FX market closures and provider/session gaps may be counted."
             ),
             "ready": self.ready,
             "reasons": list(self.reasons),

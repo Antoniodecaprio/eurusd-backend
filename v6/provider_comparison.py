@@ -22,6 +22,8 @@ YAHOO_INTERVALS = {
     "H1": ("60m", "730d"),
 }
 TIMEFRAME_PIPS = 0.0001
+# Keep API responses manageable on mobile while retaining full-series comparison.
+MAX_RETURNED_OBSERVATIONS = 200
 # Provisional research thresholds, not universal market-quality standards.
 # Keep the observed deviation visible even when it exceeds this tolerance.
 PROVIDER_DEVIATION_TOLERANCE_PIPS = {"M15": 0.5, "H1": 1.0}
@@ -78,29 +80,43 @@ def compare_provider_frames(twelve_frame: pd.DataFrame | None,
     current = current.tz_localize("UTC") if current.tzinfo is None else current.tz_convert("UTC")
 
     providers: dict[str, dict[str, Any]] = {}
+    full_rows: dict[str, list[dict[str, Any]]] = {}
     for name, frame in (("Twelve Data", twelve_frame), ("Yahoo Finance", yahoo_frame)):
         if frame is None or frame.empty:
+            full_rows[name] = []
             providers[name] = {
                 "status": "unavailable", "observations": [],
+                "total_observations": 0, "observations_returned": 0,
+                "observations_truncated": False,
                 "quality": None, "error": "No data returned",
             }
             continue
         try:
             rows, quality = _observations(frame, tf, name, current)
+            full_rows[name] = rows
+            total_observations = len(rows)
+            returned_rows = rows[-MAX_RETURNED_OBSERVATIONS:]
             providers[name] = {
                 "status": "available" if rows else "unavailable",
-                "observations": rows,
+                "observations": returned_rows,
+                "total_observations": total_observations,
+                "observations_returned": len(returned_rows),
+                "observations_truncated": total_observations > len(returned_rows),
                 "quality": quality,
                 "error": None if rows else "No completed valid candles",
             }
         except Exception as exc:
+            full_rows[name] = []
             providers[name] = {
                 "status": "unavailable", "observations": [],
+                "total_observations": 0, "observations_returned": 0,
+                "observations_truncated": False,
                 "quality": None, "error": f"Invalid provider data: {type(exc).__name__}",
             }
 
-    left = {row["candle_open_utc"]: row for row in providers["Twelve Data"]["observations"]}
-    right = {row["candle_open_utc"]: row for row in providers["Yahoo Finance"]["observations"]}
+    # Compare the complete cleaned series, not the mobile response excerpts.
+    left = {row["candle_open_utc"]: row for row in full_rows["Twelve Data"]}
+    right = {row["candle_open_utc"]: row for row in full_rows["Yahoo Finance"]}
     common = sorted(set(left).intersection(right))
     latest_diff = None
     if common:
@@ -139,6 +155,8 @@ def compare_provider_frames(twelve_frame: pd.DataFrame | None,
             ),
             "consensus_close": None,
             "consensus_note": "No consensus quote is produced in Phase 1A; provider observations remain separate.",
+            "comparison_uses_full_series": True,
+            "provider_observation_response_limit": MAX_RETURNED_OBSERVATIONS,
         },
         "limitations": [
             "Twelve Data and Yahoo Finance are independent research feeds, not broker bid/ask quotes.",

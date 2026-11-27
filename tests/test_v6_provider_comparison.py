@@ -151,6 +151,26 @@ class ProviderComparisonTests(unittest.TestCase):
         self.assertIsNone(result["comparison"]["deviation_tolerance_pips"])
 
 
+
+    def test_response_caps_each_provider_at_200_but_compares_full_series(self):
+        starts = pd.date_range("2026-11-20T00:00:00Z", periods=250, freq="15min")
+        left = self.frame(starts, [1.10] * 250)
+        right = self.frame(starts, [1.10006] * 250)
+        result = compare_provider_frames(
+            left, right, "M15",
+            now=pd.Timestamp("2026-11-23T00:00:00Z"),
+        )
+        for provider in ("Twelve Data", "Yahoo Finance"):
+            payload = result["providers"][provider]
+            self.assertEqual(payload["total_observations"], 250)
+            self.assertEqual(payload["observations_returned"], 200)
+            self.assertTrue(payload["observations_truncated"])
+            self.assertEqual(len(payload["observations"]), 200)
+        self.assertEqual(result["comparison"]["matched_candles"], 250)
+        self.assertAlmostEqual(result["comparison"]["latest_close_difference_pips"], 0.6)
+        self.assertTrue(result["comparison"]["comparison_uses_full_series"])
+        self.assertEqual(result["comparison"]["provider_observation_response_limit"], 200)
+
     def test_environment_tolerance_override_is_used(self):
         starts = pd.date_range("2026-11-27T08:00:00Z", periods=4, freq="15min")
         with patch.dict("os.environ", {"EURUSD_PROVIDER_TOLERANCE_M15_PIPS": "0.7"}):

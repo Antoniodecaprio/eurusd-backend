@@ -93,7 +93,7 @@ class CandleQualityTests(unittest.TestCase):
         frame = self.make_frame(starts)
         _, quality = normalise_candles(
             frame, "M15", "unit-test",
-            now=pd.Timestamp("2026-11-30T02:00:00Z"),
+            now=pd.Timestamp("2026-11-30T01:20:00Z"),
             minimum_candles=1,
         )
         self.assertGreater(quality.missing_interval_count, 0)

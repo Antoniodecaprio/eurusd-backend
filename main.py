@@ -67,77 +67,21 @@ class ForecastRequest(BaseModel):
 
 def get_static_calendar(forecast_days):
     """
-    Deterministic Economic Calendar. No API needed.
-    Calculates NFP dynamically (1st Friday of month, 13:30 UTC).
-    Hardcodes FOMC and ECB for the next 12 months.
+    Legacy calendar fallback.
+
+    The former implementation used expired 2024/2025 ECB and FOMC dates and
+    inferred NFP dates without checking the official release calendar. It
+    could therefore label an unverified period as LOW event risk. Until a
+    verified calendar provider is available, fail closed and require HOLD.
     """
-    now = datetime.datetime.now(datetime.timezone.utc)
-    horizon_end = now + datetime.timedelta(days=forecast_days)
-    
-    events = []
-    
-    # 1. Generate NFP dates dynamically (First Friday of current and next month)
-    for month_offset in [0, 1]:
-        target_month = now.replace(day=1) + datetime.timedelta(days=32 * month_offset)
-        first_day = target_month.replace(day=1)
-        # 4 = Friday
-        days_to_friday = (4 - first_day.weekday()) % 7
-        first_friday = first_day + datetime.timedelta(days=days_to_friday)
-        nfp_time = first_friday.replace(hour=13, minute=30, second=0, microsecond=0, tzinfo=datetime.timezone.utc)
-        
-        events.append({"name": "NFP", "time": nfp_time, "impact": "high"})
-
-    # 2. Hardcode FOMC and ECB dates (Update these quarterly)
-    # Note: Dates are set to 18:00 UTC (FOMC) and 12:15 UTC (ECB) for standard release times
-    hardcoded_dates = [
-        # FOMC 2024/2025
-        {"name": "FOMC", "time": datetime.datetime(2024, 12, 18, 19, 0, tzinfo=datetime.timezone.utc), "impact": "high"},
-        {"name": "FOMC", "time": datetime.datetime(2025, 1, 29, 19, 0, tzinfo=datetime.timezone.utc), "impact": "high"},
-        {"name": "FOMC", "time": datetime.datetime(2025, 3, 19, 18, 0, tzinfo=datetime.timezone.utc), "impact": "high"},
-        {"name": "FOMC", "time": datetime.datetime(2025, 5, 7, 18, 0, tzinfo=datetime.timezone.utc), "impact": "high"},
-        # ECB 2024/2025
-        {"name": "ECB", "time": datetime.datetime(2024, 12, 12, 13, 15, tzinfo=datetime.timezone.utc), "impact": "high"},
-        {"name": "ECB", "time": datetime.datetime(2025, 1, 30, 13, 15, tzinfo=datetime.timezone.utc), "impact": "high"},
-        {"name": "ECB", "time": datetime.datetime(2025, 3, 6, 13, 15, tzinfo=datetime.timezone.utc), "impact": "high"},
-        {"name": "ECB", "time": datetime.datetime(2025, 4, 17, 13, 15, tzinfo=datetime.timezone.utc), "impact": "high"},
-    ]
-    events.extend(hardcoded_dates)
-
-    # 3. Evaluate Risk
-    high_impact_found = False
-    events_in_horizon = []
-    
-    for event in events:
-        event_time = event["time"]
-        # Check if event is within forecast horizon
-        if now <= event_time <= horizon_end:
-            events_in_horizon.append(event["name"])
-            if event["impact"] == "high":
-                high_impact_found = True
-                
-    # Block trading 2 hours before/after any high impact event
-    blocking_window_active = False
-    for event in events:
-        if event["impact"] == "high":
-            event_time = event["time"]
-            if (event_time - datetime.timedelta(hours=2)) <= now <= (event_time + datetime.timedelta(hours=2)):
-                blocking_window_active = True
-
-    if blocking_window_active:
-        risk = "HIGH"
-        reason = "Currently inside 2h blocking window of an economic event."
-    elif high_impact_found:
-        risk = "HIGH"
-        reason = f"High impact events in horizon: {', '.join(events_in_horizon)}"
-    else:
-        risk = "LOW"
-        reason = "No high impact events detected in the forecast horizon."
-
     return {
-        "risk": risk,
-        "reason": reason,
-        "blocking_window_active": blocking_window_active,
-        "events_in_horizon": events_in_horizon
+        "risk": "UNKNOWN",
+        "reason": (
+            "No verified economic calendar is configured. "
+            "Trading signals are disabled until calendar coverage is verified."
+        ),
+        "blocking_window_active": False,
+        "events_in_horizon": [],
     }
 
 def adapt_for_flutter(data: dict) -> dict:
@@ -622,7 +566,7 @@ def get_short_term_forecast(req: ShortTermRequest):
         # 2. Deterministic Economic Calendar (No API dependency)
         calendar_state = get_static_calendar(req.forecast_days)
         event_risk = calendar_state["risk"]
-        calendar_available = True
+        calendar_available = calendar_state["risk"] in ("LOW", "HIGH")
         blocking_window_active = calendar_state["blocking_window_active"]
         
         calendar_diagnostics = {

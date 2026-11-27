@@ -154,7 +154,7 @@ def fetch_timeframe(
         )
         quality = q.as_dict()
         if tf == "D1":
-            quality["session_boundary"] = "Yahoo Finance provider-defined daily session"
+            quality["session_boundary"] = f"{source_used} provider-defined daily session"
             quality["broker_alignment_verified"] = False
 
     if candles.empty:
@@ -237,7 +237,7 @@ def fetch_market_snapshot(
                 )
                 quality = q.as_dict()
                 if tf == "D1":
-                    quality["session_boundary"] = "Yahoo Finance provider-defined daily session"
+                    quality["session_boundary"] = f"{source_used} provider-defined daily session"
                     quality["broker_alignment_verified"] = False
                 metadata = {
                     "symbol": SYMBOL,

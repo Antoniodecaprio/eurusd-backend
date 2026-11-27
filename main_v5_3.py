@@ -1206,6 +1206,9 @@ def get_showmytrades_calendar(days: int) -> dict[str, Any]:
             "days_ahead": days,
             "retrieved_at_utc": now.isoformat(),
             "server_time_utc": payload.get("server_time_iso"),
+            "coverage_start_utc": payload.get("from"),
+            "coverage_end_utc": payload.get("to"),
+            "provider_event_count": payload.get("count", len(events)),
             "events": events,
             "event_count": len(events),
             "attribution": payload.get("attribution") or {
@@ -1238,11 +1241,8 @@ def get_showmytrades_calendar(days: int) -> dict[str, Any]:
 
 
 def get_event_risk(forecast_days: int) -> dict[str, Any]:
-    """Classify future EUR/USD calendar risk; unknown data never becomes LOW."""
+    """Classify event risk only when provider coverage and event times are verifiable."""
     calendar = get_showmytrades_calendar(forecast_days)
-    now = datetime.now(timezone.utc)
-    window_end = now + timedelta(days=forecast_days)
-
     if calendar.get("status") != "available":
         return {
             "event_risk": "UNKNOWN",
@@ -1255,25 +1255,53 @@ def get_event_risk(forecast_days: int) -> dict[str, Any]:
             "calendar_error": calendar.get("error"),
         }
 
+    # Use the provider's own UTC clock and coverage window, not Render's clock.
+    now = pd.to_datetime(calendar.get("server_time_utc"), utc=True, errors="coerce")
+    coverage_start = pd.to_datetime(calendar.get("coverage_start_utc"), utc=True, errors="coerce")
+    coverage_end = pd.to_datetime(calendar.get("coverage_end_utc"), utc=True, errors="coerce")
+    if pd.isna(now) or pd.isna(coverage_start) or pd.isna(coverage_end):
+        return {
+            "event_risk": "UNKNOWN",
+            "calendar_status": "Provider response did not include verifiable server time and coverage bounds",
+            "calendar_provider": "ShowMyTrades",
+            "calendar_currencies": ["EUR", "USD"],
+            "high_impact_events": [],
+            "medium_impact_events": [],
+            "upcoming_events": [],
+        }
+
+    window_end = now + timedelta(days=forecast_days)
+    coverage_ok = bool(coverage_start <= now and coverage_end >= window_end)
+    if not coverage_ok:
+        return {
+            "event_risk": "UNKNOWN",
+            "calendar_status": "Provider coverage window does not fully cover the requested forecast horizon",
+            "calendar_provider": "ShowMyTrades",
+            "calendar_currencies": ["EUR", "USD"],
+            "high_impact_events": [],
+            "medium_impact_events": [],
+            "upcoming_events": [],
+            "calendar_start_utc": now.isoformat(),
+            "calendar_end_utc": window_end.isoformat(),
+            "provider_coverage_start_utc": coverage_start.isoformat(),
+            "provider_coverage_end_utc": coverage_end.isoformat(),
+        }
+
     high_events: list[dict[str, Any]] = []
     medium_events: list[dict[str, Any]] = []
     upcoming_events: list[dict[str, Any]] = []
     malformed_event_time = False
     malformed_event_metadata = False
-    raw_events = calendar.get("events", [])
-    valid_event_times = 0
 
-    for event in raw_events:
-        impact = str(event.get("impact", "")).lower()
+    for event in calendar.get("events", []):
         event_time = pd.to_datetime(event.get("datetime_utc"), utc=True, errors="coerce")
         if pd.isna(event_time):
             malformed_event_time = True
             continue
-        valid_event_times += 1
-        event_dt = event_time.to_pydatetime()
-        if now <= event_dt <= window_end:
+        if now <= event_time <= window_end:
             upcoming_events.append(event)
             currency = str(event.get("currency", "")).upper()
+            impact = str(event.get("impact", "")).lower()
             if impact not in {"high", "medium"} or currency not in {"EUR", "USD"}:
                 malformed_event_metadata = True
             elif impact == "high":
@@ -1281,23 +1309,19 @@ def get_event_risk(forecast_days: int) -> dict[str, Any]:
             elif impact == "medium":
                 medium_events.append(event)
 
-    if high_events:
+    if malformed_event_time or malformed_event_metadata:
+        risk = "UNKNOWN"
+        status = "One or more event records have unverified time, currency or impact metadata"
+    elif high_events:
         risk = "HIGH"
         status = "One or more high-impact EUR/USD events are scheduled in the forecast window"
-    elif malformed_event_time or malformed_event_metadata or valid_event_times == 0 or not upcoming_events:
-        risk = "UNKNOWN"
-        if malformed_event_time:
-            status = "One or more calendar event times could not be verified"
-        elif malformed_event_metadata:
-            status = "One or more upcoming events lacked a valid EUR/USD currency or impact label"
-        else:
-            status = "No valid upcoming event records were returned; calendar coverage cannot be confirmed"
     elif medium_events:
         risk = "MEDIUM"
         status = "No high-impact release found, but medium-impact EUR/USD events are scheduled"
     else:
+        # Empty event lists are valid only when the full requested window is verified.
         risk = "LOW"
-        status = "ShowMyTrades calendar checked successfully; no high- or medium-impact event is scheduled in the forecast window"
+        status = "Verified provider coverage contains no high- or medium-impact EUR/USD event in the forecast window"
 
     return {
         "event_risk": risk,
@@ -1309,7 +1333,10 @@ def get_event_risk(forecast_days: int) -> dict[str, Any]:
         "upcoming_events": upcoming_events,
         "calendar_start_utc": now.isoformat(),
         "calendar_end_utc": window_end.isoformat(),
+        "provider_coverage_start_utc": coverage_start.isoformat(),
+        "provider_coverage_end_utc": coverage_end.isoformat(),
         "calendar_days_ahead": forecast_days,
+        "calendar_event_count": len(calendar.get("events", [])),
     }
 
 

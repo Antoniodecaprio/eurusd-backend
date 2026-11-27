@@ -147,8 +147,9 @@ def fetch_timeframe(
             raise ValueError(f"Unsupported timeframe: {timeframe}")
         interval, period = INTERVALS[tf]
         raw = _download(interval, period)
+        source_used = raw.attrs.get("source", "Yahoo Finance (yfinance)")
         candles, q = normalise_candles(
-            raw, tf, SOURCE, now=current, minimum_candles=minimum_candles
+            raw, tf, source_used, now=current, minimum_candles=minimum_candles
         )
         quality = q.as_dict()
         if tf == "D1":
@@ -228,8 +229,9 @@ def fetch_market_snapshot(
             elif tf in errors:
                 raise MarketDataError(errors[tf])
             elif tf in raw_frames:
+                source_used = raw_frames[tf].attrs.get("source", "Yahoo Finance (yfinance)")
                 candles, q = normalise_candles(
-                    raw_frames[tf], tf, SOURCE, minimum_candles=minimum_candles
+                    raw_frames[tf], tf, source_used, minimum_candles=minimum_candles
                 )
                 quality = q.as_dict()
                 if tf == "D1":
@@ -238,7 +240,7 @@ def fetch_market_snapshot(
                 metadata = {
                     "symbol": SYMBOL,
                     "timeframe": tf,
-                    "source": SOURCE,
+                    "source": source_used,
                     "retrieved_at_utc": datetime.now(timezone.utc).isoformat(),
                     "quality": quality,
                     "limitations": [

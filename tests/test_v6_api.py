@@ -37,6 +37,7 @@ class V6ApiTests(unittest.TestCase):
                             "age_seconds": 30,
                             "stale": False,
                             "missing_interval_count": 4,
+                            "missing_interval_interpretation": "Raw elapsed-time gaps; not session-aware.",
                             "duplicate_count": 0,
                             "invalid_count": 0,
                             "ready": True,

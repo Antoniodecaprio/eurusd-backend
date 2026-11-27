@@ -181,7 +181,15 @@ def resample_completed(
     if frame is None or frame.empty:
         return pd.DataFrame(columns=list(REQUIRED_OHLC))
 
-    data = frame.copy().sort_index()
+    data = frame.copy()
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = [str(col[-1]).strip().lower() for col in data.columns]
+    else:
+        data.columns = [str(col).strip().lower() for col in data.columns]
+    missing = [col for col in REQUIRED_OHLC if col not in data.columns]
+    if missing:
+        raise ValueError("Missing OHLC columns: " + ", ".join(missing))
+    data = data.sort_index()
     current = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
     if current.tzinfo is None:
         current = current.tz_localize("UTC")

@@ -97,6 +97,7 @@ class CandleQualityTests(unittest.TestCase):
             minimum_candles=1,
         )
         self.assertGreater(quality.missing_interval_count, 0)
+        self.assertIn("not session-aware", quality.as_dict()["missing_interval_interpretation"])
         self.assertTrue(quality.ready)
 
     def test_m15_freshness_limit_is_thirty_minutes(self):

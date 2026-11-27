@@ -6,6 +6,8 @@ Do not use it to calculate final MT5 entry prices, spread, pip value or fills.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from threading import Lock
+from time import monotonic
 from typing import Any
 
 import pandas as pd
@@ -16,6 +18,11 @@ from .data_quality import normalise_candles, resample_completed
 
 SYMBOL = "EURUSD=X"
 SOURCE = "Yahoo Finance (yfinance)"
+# Short-lived process cache reduces duplicate provider calls and softens rate limits.
+_CACHE_TTL_SECONDS = {"15m": 60, "60m": 300, "1d": 3600}
+_cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
+_rate_limited_until = 0.0
+_cache_lock = Lock()
 INTERVALS = {
     "M15": ("15m", "60d"),
     "H1": ("60m", "730d"),
@@ -28,6 +35,19 @@ class MarketDataError(RuntimeError):
 
 
 def _download(interval: str, period: str) -> pd.DataFrame:
+    """Download with a small in-process cache and rate-limit cooldown."""
+    global _rate_limited_until
+    key = (interval, period)
+    now_mono = monotonic()
+    with _cache_lock:
+        cached = _cache.get(key)
+        if cached and now_mono - cached[0] <= _CACHE_TTL_SECONDS.get(interval, 60):
+            return cached[1].copy()
+        if now_mono < _rate_limited_until:
+            if cached:
+                return cached[1].copy()
+            raise MarketDataError(f"{SOURCE} rate-limit cooldown active for {interval}")
+
     try:
         frame = yf.Ticker(SYMBOL).history(
             period=period,
@@ -37,9 +57,19 @@ def _download(interval: str, period: str) -> pd.DataFrame:
             raise_errors=True,
         )
     except Exception as exc:
-        raise MarketDataError(f"{SOURCE} request failed: {type(exc).__name__}") from exc
+        name = type(exc).__name__
+        if "RateLimit" in name or "TooManyRequests" in name:
+            with _cache_lock:
+                _rate_limited_until = monotonic() + 120
+                cached = _cache.get(key)
+            if cached:
+                return cached[1].copy()
+        raise MarketDataError(f"{SOURCE} request failed: {name}") from exc
     if frame is None or frame.empty:
         raise MarketDataError(f"{SOURCE} returned no {interval} candles")
+    with _cache_lock:
+        _cache[key] = (monotonic(), frame.copy())
+        _rate_limited_until = 0.0
     return frame
 
 

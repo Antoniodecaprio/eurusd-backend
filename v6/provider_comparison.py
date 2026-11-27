@@ -22,6 +22,9 @@ YAHOO_INTERVALS = {
     "H1": ("60m", "730d"),
 }
 TIMEFRAME_PIPS = 0.0001
+# Provisional research thresholds, not universal market-quality standards.
+# Keep the observed deviation visible even when it exceeds this tolerance.
+PROVIDER_DEVIATION_TOLERANCE_PIPS = {"M15": 0.5, "H1": 1.0}
 
 
 def _observations(frame: pd.DataFrame, timeframe: str, provider: str,
@@ -91,6 +94,13 @@ def compare_provider_frames(twelve_frame: pd.DataFrame | None,
         latest = common[-1]
         latest_diff = abs(left[latest]["close"] - right[latest]["close"]) / TIMEFRAME_PIPS
 
+    tolerance = PROVIDER_DEVIATION_TOLERANCE_PIPS[tf]
+    deviation_status = (
+        "not_comparable" if latest_diff is None else
+        "within_tolerance" if latest_diff <= tolerance else
+        "above_tolerance"
+    )
+
     both_available = all(providers[name]["status"] == "available" for name in providers)
     comparison_status = (
         "compared" if common else
@@ -108,6 +118,12 @@ def compare_provider_frames(twelve_frame: pd.DataFrame | None,
             "latest_matched_candle_open_utc": common[-1] if common else None,
             "latest_close_difference_pips": latest_diff,
             "difference_unit": "pips (0.0001 EUR/USD price units)",
+            "deviation_tolerance_pips": tolerance if latest_diff is not None else None,
+            "deviation_status": deviation_status,
+            "deviation_tolerance_note": (
+                "Provisional configurable research threshold; exceeding it flags "
+                "provider disagreement but does not reject either feed."
+            ),
             "consensus_close": None,
             "consensus_note": "No consensus quote is produced in Phase 1A; provider observations remain separate.",
         },

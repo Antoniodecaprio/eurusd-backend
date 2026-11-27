@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import logging
 import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from v6.market_data import fetch_market_snapshot
@@ -60,7 +60,7 @@ def status():
         "environment": "staging",
         "mode": "research_only",
         "supported_timeframes": ["M15", "H1", "H4", "D1"],
-        "market_data_provider": "Yahoo Finance (research feed)",
+        "market_data_provider": ("Twelve Data primary; Yahoo Finance fallback" if os.getenv("TWELVE_DATA_KEY", "").strip() else "Yahoo Finance (research feed; Twelve Data key not configured)"),
         "forecast_models_enabled": False,
         "calendar_verified": False,
         "mt5_execution_enabled": False,
@@ -145,3 +145,42 @@ def market_quality():
         "trading_enabled": False,
         "timeframes": summary,
     }
+
+
+@app.get("/v6/market-snapshot-lite")
+def market_snapshot_lite(
+    timeframes: str = Query("M15,H1,H4,D1", description="Comma-separated: M15,H1,H4,D1"),
+    limit: int = Query(100, ge=1, le=500, description="Candles per timeframe, maximum 500"),
+):
+    """Mobile-friendly snapshot: selected timeframes and bounded candle arrays."""
+    requested = tuple(dict.fromkeys(
+        part.strip().upper() for part in timeframes.split(",") if part.strip()
+    ))
+    allowed = {"M15", "H1", "H4", "D1"}
+    if not requested or any(tf not in allowed for tf in requested):
+        raise HTTPException(status_code=400, detail="Use one or more timeframes from M15,H1,H4,D1")
+
+    try:
+        result = fetch_market_snapshot(requested, include_candles=True)
+    except Exception as exc:
+        logger.exception("Unexpected compact market snapshot failure")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Market snapshot failed: {type(exc).__name__}",
+        ) from exc
+
+    for timeframe, item in result.get("timeframes", {}).items():
+        candles = item.get("candles") or []
+        item["candles_total_returnable"] = len(candles)
+        item["candles_limit"] = limit
+        item["candles"] = candles[-limit:]
+
+    statuses = [item.get("status", "unknown") for item in result.get("timeframes", {}).values()]
+    result["overall_status"] = (
+        "ready" if statuses and all(status == "ready" for status in statuses)
+        else "partial_or_unavailable"
+    )
+    result["trading_enabled"] = False
+    result["response_mode"] = "compact"
+    result["note"] = "Candle arrays are capped per timeframe for mobile viewing; research data only."
+    return result

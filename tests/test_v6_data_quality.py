@@ -52,6 +52,16 @@ class CandleQualityTests(unittest.TestCase):
         self.assertEqual(len(hourly), 1)
         self.assertEqual(hourly.index[0], pd.Timestamp("2026-11-27T08:00:00Z"))
 
+
+    def test_resampling_accepts_provider_title_case_columns(self):
+        starts = pd.date_range("2026-11-27T08:00:00Z", periods=4, freq="15min")
+        frame = self.make_frame(starts)
+        hourly = resample_completed(
+            frame, "M15", "H1", now=pd.Timestamp("2026-11-27T09:05:00Z")
+        )
+        self.assertEqual(len(hourly), 1)
+        self.assertEqual(float(hourly.iloc[0]["close"]), 1.10)
+
     def test_stale_data_is_not_ready(self):
         starts = pd.date_range("2026-11-27T01:00:00Z", periods=4, freq="15min")
         frame = self.make_frame(starts)

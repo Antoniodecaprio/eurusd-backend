@@ -164,10 +164,34 @@ def fetch_market_snapshot(
         "retrieved_at_utc": datetime.now(timezone.utc).isoformat(),
         "timeframes": {},
     }
+    h1_base: tuple[pd.DataFrame, DataQuality] | None = None
     for timeframe in timeframes:
         tf = timeframe.upper()
         try:
-            candles, metadata = fetch_timeframe(tf, minimum_candles=minimum_candles)
+            if tf == "H1":
+                raw = _download(*INTERVALS["H1"])
+                candles, h1_quality = normalise_candles(
+                    raw, "H1", SOURCE, minimum_candles=minimum_candles
+                )
+                h1_base = (candles, h1_quality)
+                metadata = {
+                    "symbol": SYMBOL,
+                    "timeframe": "H1",
+                    "source": SOURCE,
+                    "retrieved_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "quality": h1_quality.as_dict(),
+                    "limitations": [
+                        "Free third-party research feed; availability and history limits may change.",
+                        "Not a broker quote; spread, slippage and executable prices are unavailable.",
+                        "Provider data may be delayed, revised, rate-limited or temporarily unavailable.",
+                    ],
+                }
+            elif tf == "H4" and h1_base is not None:
+                candles, metadata = fetch_timeframe(
+                    tf, minimum_candles=minimum_candles, base_h1=h1_base
+                )
+            else:
+                candles, metadata = fetch_timeframe(tf, minimum_candles=minimum_candles)
             result["timeframes"][tf] = {
                 "status": "ready" if metadata["quality"]["ready"] else "not_ready",
                 "metadata": metadata,

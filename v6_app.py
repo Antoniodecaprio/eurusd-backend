@@ -72,7 +72,7 @@ def status():
 def market_snapshot():
     """Fetch independent timeframe snapshots and return quality metadata."""
     try:
-        result = fetch_market_snapshot(("M15", "H1", "H4", "D1"))
+        result = fetch_market_snapshot(("M15", "H1", "H4", "D1"), include_candles=False)
     except Exception as exc:
         logger.exception("Unexpected market snapshot failure")
         raise HTTPException(

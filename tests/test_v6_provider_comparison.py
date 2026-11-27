@@ -107,5 +107,48 @@ class ProviderComparisonTests(unittest.TestCase):
         self.assertIsNone(result["comparison"]["consensus_close"])
 
 
+    def test_m15_deviation_within_tolerance_is_classified_without_hiding_value(self):
+        starts = pd.date_range("2026-11-27T08:00:00Z", periods=4, freq="15min")
+        result = compare_provider_frames(
+            self.frame(starts), self.frame(starts, [1.10005] * 4), "M15",
+            now=pd.Timestamp("2026-11-27T09:05:00Z"),
+        )
+        comparison = result["comparison"]
+        self.assertEqual(comparison["deviation_status"], "within_tolerance")
+        self.assertAlmostEqual(comparison["latest_close_difference_pips"], 0.5)
+        self.assertEqual(comparison["deviation_tolerance_pips"], 0.5)
+
+    def test_m15_deviation_above_tolerance_is_flagged_not_rejected(self):
+        starts = pd.date_range("2026-11-27T08:00:00Z", periods=4, freq="15min")
+        result = compare_provider_frames(
+            self.frame(starts), self.frame(starts, [1.10006] * 4), "M15",
+            now=pd.Timestamp("2026-11-27T09:05:00Z"),
+        )
+        comparison = result["comparison"]
+        self.assertEqual(comparison["deviation_status"], "above_tolerance")
+        self.assertAlmostEqual(comparison["latest_close_difference_pips"], 0.6)
+        self.assertEqual(comparison["matched_candles"], 4)
+        self.assertIsNone(comparison["consensus_close"])
+
+    def test_h1_uses_its_own_deviation_tolerance(self):
+        starts = pd.date_range("2026-11-27T04:00:00Z", periods=4, freq="1h")
+        result = compare_provider_frames(
+            self.frame(starts), self.frame(starts, [1.10009] * 4), "H1",
+            now=pd.Timestamp("2026-11-27T09:00:00Z"),
+        )
+        comparison = result["comparison"]
+        self.assertEqual(comparison["deviation_status"], "within_tolerance")
+        self.assertEqual(comparison["deviation_tolerance_pips"], 1.0)
+
+    def test_no_deviation_classification_without_matching_candles(self):
+        a = pd.date_range("2026-11-27T08:00:00Z", periods=4, freq="15min")
+        b = pd.date_range("2026-11-27T10:00:00Z", periods=4, freq="15min")
+        result = compare_provider_frames(
+            self.frame(a), self.frame(b), "M15",
+            now=pd.Timestamp("2026-11-27T11:00:00Z"),
+        )
+        self.assertEqual(result["comparison"]["deviation_status"], "not_comparable")
+        self.assertIsNone(result["comparison"]["deviation_tolerance_pips"])
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,7 @@
+# Runtime dependencies for the v6 research/staging API only.
+# Keep the full requirements.txt unchanged for legacy services and model work.
+fastapi>=0.110,<1.0
+uvicorn>=0.27,<1.0
+pandas>=2.2,<3.0
+yfinance>=0.2.40,<1.0
+requests>=2.31,<3.0

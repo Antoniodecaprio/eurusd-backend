@@ -114,8 +114,9 @@ def fetch_timeframe(
     if tf == "H4":
         if base_h1 is None:
             base = _download(*INTERVALS["H1"])
+            base_source = base.attrs.get("source", "Yahoo Finance (yfinance)")
             clean_h1, base_quality = normalise_candles(
-                base, "H1", SOURCE, now=current, minimum_candles=minimum_candles * 4
+                base, "H1", base_source, now=current, minimum_candles=minimum_candles * 4
             )
         else:
             clean_h1, base_quality = base_h1
@@ -132,7 +133,7 @@ def fetch_timeframe(
         ready = bool(len(candles) >= minimum_candles and not h4_stale and base_quality.ready)
         quality = {
             "timeframe": "H4",
-            "source": SOURCE,
+            "source": clean_h1.attrs.get("source", "derived from H1"),
             "base_timeframe": "H1",
             "candle_count": int(len(candles)),
             "last_candle_close_utc": last_close.isoformat() if last_close is not None else None,
@@ -161,7 +162,7 @@ def fetch_timeframe(
     return candles, {
         "symbol": SYMBOL,
         "timeframe": tf,
-        "source": SOURCE,
+        "source": quality.get("source", "unknown"),
         "retrieved_at_utc": datetime.now(timezone.utc).isoformat(),
         "quality": quality,
         "limitations": [
@@ -213,8 +214,9 @@ def fetch_market_snapshot(
 
     h1_base: tuple[pd.DataFrame, DataQuality] | None = None
     if "H1" in raw_frames:
+        h1_source = raw_frames["H1"].attrs.get("source", "Yahoo Finance (yfinance)")
         h1_clean, h1_quality = normalise_candles(
-            raw_frames["H1"], "H1", SOURCE, minimum_candles=minimum_candles
+            raw_frames["H1"], "H1", h1_source, minimum_candles=minimum_candles
         )
         h1_base = (h1_clean, h1_quality)
 

@@ -1,0 +1,24 @@
+name: Backend safety checks
+
+on:
+  push:
+    branches:
+      - v6-development
+  pull_request:
+    branches:
+      - v6-development
+
+jobs:
+  python-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile backend and tests
+        run: python -m compileall -q main.py main_v5_3.py tests
+      - name: Run safety regression tests
+        run: python -m unittest discover -s tests -v

@@ -13,7 +13,7 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
-from .data_quality import normalise_candles, resample_completed
+from .data_quality import DataQuality, normalise_candles, resample_completed
 
 
 SYMBOL = "EURUSD=X"
@@ -78,6 +78,7 @@ def fetch_timeframe(
     *,
     now: pd.Timestamp | None = None,
     minimum_candles: int = 100,
+    base_h1: tuple[pd.DataFrame, DataQuality] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Fetch and validate one timeframe; H4 is aggregated from H1 candles.
 
@@ -92,10 +93,13 @@ def fetch_timeframe(
         current = current.tz_convert("UTC")
 
     if tf == "H4":
-        base = _download(*INTERVALS["H1"])
-        clean_h1, base_quality = normalise_candles(
-            base, "H1", SOURCE, now=current, minimum_candles=minimum_candles * 4
-        )
+        if base_h1 is None:
+            base = _download(*INTERVALS["H1"])
+            clean_h1, base_quality = normalise_candles(
+                base, "H1", SOURCE, now=current, minimum_candles=minimum_candles * 4
+            )
+        else:
+            clean_h1, base_quality = base_h1
         candles = resample_completed(clean_h1, "H1", "H4", now=current)
         last_close = (
             candles.index[-1] + pd.Timedelta(hours=4)
@@ -105,8 +109,8 @@ def fetch_timeframe(
             max(0.0, (current - last_close).total_seconds())
             if last_close is not None else None
         )
-        ready = bool(len(candles) >= minimum_candles and age is not None
-                     and age <= pd.Timedelta(hours=10).total_seconds())
+        h4_stale = age is None or age > pd.Timedelta(hours=6).total_seconds()
+        ready = bool(len(candles) >= minimum_candles and not h4_stale and base_quality.ready)
         quality = {
             "timeframe": "H4",
             "source": SOURCE,
@@ -114,9 +118,9 @@ def fetch_timeframe(
             "candle_count": int(len(candles)),
             "last_candle_close_utc": last_close.isoformat() if last_close is not None else None,
             "age_seconds": age,
-            "stale": not ready and last_close is not None,
+            "stale": h4_stale,
             "ready": ready,
-            "reasons": [] if ready else ["insufficient_or_stale_completed_h4_candles"],
+            "reasons": [] if ready else ["h4_or_base_h1_quality_check_failed"],
             "base_quality": base_quality.as_dict(),
         }
     else:

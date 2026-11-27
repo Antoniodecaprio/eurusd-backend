@@ -14,10 +14,11 @@ import pandas as pd
 import yfinance as yf
 
 from .data_quality import DataQuality, normalise_candles, resample_completed
+from .twelvedata import TwelveDataError, fetch_candles as fetch_twelve_data_candles
 
 
 SYMBOL = "EURUSD=X"
-SOURCE = "Yahoo Finance (yfinance)"
+SOURCE = "Twelve Data primary; Yahoo Finance fallback"
 # Short-lived process cache reduces duplicate provider calls and softens rate limits.
 _CACHE_TTL_SECONDS = {"15m": 60, "60m": 300, "1d": 3600}
 _cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
@@ -47,25 +48,43 @@ def _download(interval: str, period: str) -> pd.DataFrame:
                 return cached[1].copy()
             raise MarketDataError(f"{SOURCE} rate-limit cooldown active for {interval}")
 
-    try:
-        frame = yf.Ticker(SYMBOL).history(
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            actions=False,
-            raise_errors=True,
-        )
-    except Exception as exc:
-        name = type(exc).__name__
-        if "RateLimit" in name or "TooManyRequests" in name:
-            with _cache_lock:
-                _rate_limited_until[key] = monotonic() + 120
-                cached = _cache.get(key)
-            if cached:
-                return cached[1].copy()
-        raise MarketDataError(f"{SOURCE} request failed: {name}") from exc
+    frame = None
+    provider_error = None
+    # Prefer Twelve Data when configured. If it is unavailable or rate-limited,
+    # use Yahoo as a clearly labelled research fallback.
+    if os.getenv("TWELVE_DATA_KEY", "").strip():
+        tf = {"15m": "M15", "60m": "H1", "1d": "D1"}.get(interval)
+        try:
+            frame = fetch_twelve_data_candles(tf)
+            frame.attrs["source"] = "Twelve Data"
+        except (TwelveDataError, ValueError) as exc:
+            provider_error = str(exc)
+            if "429" in provider_error or "rate" in provider_error.lower() or "credit" in provider_error.lower():
+                with _cache_lock:
+                    _rate_limited_until[key] = monotonic() + 120
+
+    if frame is None:
+        try:
+            frame = yf.Ticker(SYMBOL).history(
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                actions=False,
+                raise_errors=True,
+            )
+            if frame is not None and not frame.empty:
+                frame.attrs["source"] = "Yahoo Finance (yfinance)"
+        except Exception as exc:
+            name = type(exc).__name__
+            if "RateLimit" in name or "TooManyRequests" in name:
+                with _cache_lock:
+                    _rate_limited_until[key] = monotonic() + 120
+                provider_error = provider_error or f"Yahoo rate limit: {name}"
+            else:
+                provider_error = provider_error or f"Yahoo request failed: {name}"
+
     if frame is None or frame.empty:
-        raise MarketDataError(f"{SOURCE} returned no {interval} candles")
+        raise MarketDataError(provider_error or f"{SOURCE} returned no {interval} candles")
     with _cache_lock:
         _cache[key] = (monotonic(), frame.copy())
         _rate_limited_until.pop(key, None)

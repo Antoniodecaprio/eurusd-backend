@@ -18,7 +18,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+      - name: Install backend dependencies
+        run: python -m pip install -r requirements.txt
       - name: Compile backend and tests
         run: python -m compileall -q main.py main_v5_3.py tests
+      - name: Import both FastAPI applications
+        run: python -c "import main; import main_v5_3; print('Both FastAPI applications imported successfully')"
       - name: Run safety regression tests
         run: python -m unittest discover -s tests -v

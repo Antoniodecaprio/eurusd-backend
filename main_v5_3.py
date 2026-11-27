@@ -1257,14 +1257,13 @@ def get_event_risk(forecast_days: int) -> dict[str, Any]:
             "calendar_error": calendar.get("error"),
         }
 
-    # Use the provider's own UTC clock and coverage window, not Render's clock.
     now = pd.to_datetime(calendar.get("server_time_utc"), utc=True, errors="coerce")
     coverage_start = pd.to_datetime(calendar.get("coverage_start_utc"), utc=True, errors="coerce")
     coverage_end = pd.to_datetime(calendar.get("coverage_end_utc"), utc=True, errors="coerce")
     if pd.isna(now) or pd.isna(coverage_start) or pd.isna(coverage_end):
         return {
             "event_risk": "UNKNOWN",
-            "calendar_status": "Provider response did not include verifiable server time and coverage bounds",
+            "calendar_status": "Provider response lacks verifiable server time or coverage bounds",
             "calendar_provider": "ShowMyTrades",
             "calendar_currencies": ["EUR", "USD"],
             "high_impact_events": [],
@@ -1273,11 +1272,10 @@ def get_event_risk(forecast_days: int) -> dict[str, Any]:
         }
 
     window_end = now + timedelta(days=forecast_days)
-    coverage_ok = bool(coverage_start <= now and coverage_end >= window_end)
-    if not coverage_ok:
+    if not (coverage_start <= now and coverage_end >= window_end):
         return {
             "event_risk": "UNKNOWN",
-            "calendar_status": "Provider coverage window does not fully cover the requested forecast horizon",
+            "calendar_status": "Provider coverage does not fully cover the requested forecast horizon",
             "calendar_provider": "ShowMyTrades",
             "calendar_currencies": ["EUR", "USD"],
             "high_impact_events": [],
@@ -1316,12 +1314,11 @@ def get_event_risk(forecast_days: int) -> dict[str, Any]:
         status = "One or more event records have unverified time, currency or impact metadata"
     elif high_events:
         risk = "HIGH"
-        status = "One or more high-impact EUR/USD events are scheduled in the forecast window"
+        status = "High-impact EUR/USD events are scheduled in the forecast window"
     elif medium_events:
         risk = "MEDIUM"
-        status = "No high-impact release found, but medium-impact EUR/USD events are scheduled"
+        status = "Medium-impact EUR/USD events are scheduled in the forecast window"
     else:
-        # Empty event lists are valid only when the full requested window is verified.
         risk = "LOW"
         status = "Verified provider coverage contains no high- or medium-impact EUR/USD event in the forecast window"
 

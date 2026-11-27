@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from v6.market_data import fetch_market_snapshot
+from v6.provider_comparison import fetch_provider_evidence
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("eurusd_v6")
@@ -186,3 +187,21 @@ def market_snapshot_lite(
     result["response_mode"] = "compact"
     result["note"] = "Candle arrays are capped per timeframe for mobile viewing; research data only."
     return result
+
+
+@app.get("/v6/provider-evidence")
+def provider_evidence(
+    timeframe: str = Query("M15", description="M15 or H1"),
+):
+    """Compare independent EUR/USD research-feed observations; no trading signal."""
+    requested = timeframe.strip().upper()
+    if requested not in {"M15", "H1"}:
+        raise HTTPException(status_code=400, detail="Use M15 or H1")
+    try:
+        return fetch_provider_evidence(requested)
+    except Exception as exc:
+        logger.exception("Unexpected provider evidence failure")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Provider evidence failed: {type(exc).__name__}",
+        ) from exc

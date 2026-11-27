@@ -21,6 +21,12 @@ INTERVALS = {
 }
 
 REQUIRED_OHLC = ("open", "high", "low", "close")
+MAX_AGE = {
+    "M15": pd.Timedelta(minutes=30),
+    "H1": pd.Timedelta(minutes=90),
+    "H4": pd.Timedelta(hours=6),
+    "D1": pd.Timedelta(hours=36),
+}
 
 
 @dataclass(frozen=True)
@@ -65,7 +71,7 @@ def normalise_candles(
     timeframe: str,
     source: str,
     now: Optional[pd.Timestamp] = None,
-    stale_after_intervals: float = 2.5,
+    stale_after_intervals: float | None = None,
     minimum_candles: int = 100,
 ) -> tuple[pd.DataFrame, DataQuality]:
     """Return validated, completed OHLC candles indexed by UTC candle-open time.
@@ -129,7 +135,7 @@ def normalise_candles(
         last_open = data.index[-1]
         last_close_ts = last_open + delta
         age_seconds = max(0.0, (current - last_close_ts).total_seconds())
-        stale = age_seconds > delta.total_seconds() * stale_after_intervals
+        stale = age_seconds > MAX_AGE[timeframe.upper()].total_seconds()
         last_close = last_close_ts.isoformat()
         if stale:
             reasons.append("latest_completed_candle_is_stale")
@@ -145,7 +151,16 @@ def normalise_candles(
 
     if len(data) < minimum_candles:
         reasons.append("insufficient_completed_candles")
-    ready = bool(len(data) >= minimum_candles and not stale)
+    ready = bool(
+        len(data) >= minimum_candles
+        and not stale
+        and duplicate_count == 0
+        and invalid_count == 0
+    )
+    if duplicate_count:
+        reasons.append("duplicate_rows_present")
+    if invalid_count:
+        reasons.append("invalid_rows_present")
     quality = DataQuality(
         timeframe=timeframe.upper(),
         source=source,

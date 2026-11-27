@@ -155,46 +155,87 @@ def fetch_market_snapshot(
     timeframes: tuple[str, ...] = ("M15", "H1", "H4", "D1"),
     *,
     minimum_candles: int = 100,
+    include_candles: bool = True,
 ) -> dict[str, Any]:
-    """Fetch requested horizons independently and report per-timeframe failures."""
+    """Fetch provider intervals concurrently, derive H4 from H1, and report failures."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     result: dict[str, Any] = {
         "symbol": SYMBOL,
         "source": SOURCE,
         "retrieved_at_utc": datetime.now(timezone.utc).isoformat(),
         "timeframes": {},
     }
+    requested = tuple(dict.fromkeys(tf.upper() for tf in timeframes))
+    provider_jobs = {
+        tf: INTERVALS[tf]
+        for tf in requested
+        if tf in ("M15", "H1", "D1")
+    }
+    raw_frames: dict[str, pd.DataFrame] = {}
+    errors: dict[str, str] = {}
+
+    # Parallelize independent provider calls; H4 is derived locally from H1.
+    with ThreadPoolExecutor(max_workers=max(1, len(provider_jobs))) as pool:
+        futures = {
+            pool.submit(_download, *interval): tf
+            for tf, interval in provider_jobs.items()
+        }
+        for future in as_completed(futures):
+            tf = futures[future]
+            try:
+                raw_frames[tf] = future.result()
+            except (MarketDataError, ValueError) as exc:
+                errors[tf] = str(exc)
+            except Exception as exc:
+                errors[tf] = f"Provider request failed: {type(exc).__name__}"
+
     h1_base: tuple[pd.DataFrame, DataQuality] | None = None
-    for timeframe in timeframes:
-        tf = timeframe.upper()
+    if "H1" in raw_frames:
+        h1_clean, h1_quality = normalise_candles(
+            raw_frames["H1"], "H1", SOURCE, minimum_candles=minimum_candles
+        )
+        h1_base = (h1_clean, h1_quality)
+
+    for tf in requested:
         try:
-            if tf == "H1":
-                raw = _download(*INTERVALS["H1"])
-                candles, h1_quality = normalise_candles(
-                    raw, "H1", SOURCE, minimum_candles=minimum_candles
+            if tf == "H4":
+                if h1_base is None:
+                    raise MarketDataError(errors.get("H1", "H1 data unavailable for H4 aggregation"))
+                candles, metadata = fetch_timeframe(
+                    "H4", minimum_candles=minimum_candles, base_h1=h1_base
                 )
-                h1_base = (candles, h1_quality)
+            elif tf in errors:
+                raise MarketDataError(errors[tf])
+            elif tf in raw_frames:
+                candles, q = normalise_candles(
+                    raw_frames[tf], tf, SOURCE, minimum_candles=minimum_candles
+                )
+                quality = q.as_dict()
+                if tf == "D1":
+                    quality["session_boundary"] = "Yahoo Finance provider-defined daily session"
+                    quality["broker_alignment_verified"] = False
                 metadata = {
                     "symbol": SYMBOL,
-                    "timeframe": "H1",
+                    "timeframe": tf,
                     "source": SOURCE,
                     "retrieved_at_utc": datetime.now(timezone.utc).isoformat(),
-                    "quality": h1_quality.as_dict(),
+                    "quality": quality,
                     "limitations": [
                         "Free third-party research feed; availability and history limits may change.",
                         "Not a broker quote; spread, slippage and executable prices are unavailable.",
                         "Provider data may be delayed, revised, rate-limited or temporarily unavailable.",
                     ],
                 }
-            elif tf == "H4" and h1_base is not None:
-                candles, metadata = fetch_timeframe(
-                    tf, minimum_candles=minimum_candles, base_h1=h1_base
-                )
             else:
-                candles, metadata = fetch_timeframe(tf, minimum_candles=minimum_candles)
-            result["timeframes"][tf] = {
+                raise ValueError(f"Unsupported timeframe: {tf}")
+
+            item = {
                 "status": "ready" if metadata["quality"]["ready"] else "not_ready",
                 "metadata": metadata,
-                "candles": [
+            }
+            if include_candles:
+                item["candles"] = [
                     {
                         "time": timestamp.isoformat(),
                         "open": float(row.open),
@@ -203,12 +244,12 @@ def fetch_market_snapshot(
                         "close": float(row.close),
                     }
                     for timestamp, row in candles.iterrows()
-                ],
-            }
+                ]
+            result["timeframes"][tf] = item
         except (MarketDataError, ValueError) as exc:
             result["timeframes"][tf] = {
                 "status": "unavailable",
                 "error": str(exc),
-                "candles": [],
+                **({"candles": []} if include_candles else {}),
             }
     return result

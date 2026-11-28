@@ -22,7 +22,7 @@ logger = logging.getLogger("eurusd_v6")
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    stream_enabled = os.getenv("BIQUOTE_STREAM_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    stream_enabled = os.getenv("BIQUOTE_STREAM_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
     if stream_enabled:
         await biquote_stream_supervisor.start()
         logger.info("biquote SignalR stream supervisor started")

@@ -33,7 +33,6 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(
-    lifespan=lifespan,
     title="EUR/USD Distribution Forecaster v6",
     lifespan=lifespan,
     version="6.0.0-dev",

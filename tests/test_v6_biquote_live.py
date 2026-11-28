@@ -13,7 +13,7 @@ class BiquoteLiveTests(unittest.TestCase):
     def payload(self, **updates):
         value = {
             "symbol": "EURUSD", "bid": 1.08542, "ask": 1.08548,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(), "marketState": "open", "stale": False,
         }
         value.update(updates)
         return value
@@ -49,6 +49,17 @@ class BiquoteLiveTests(unittest.TestCase):
         future = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
         with self.assertRaisesRegex(BiquoteLiveError, "quote_timestamp_in_future"):
             validate_quote(self.payload(timestamp=future))
+
+    def test_provider_closed_market_is_not_reported_live(self):
+        quote = validate_quote(self.payload(marketState="closed"))
+        self.assertFalse(quote["market_open"])
+        self.assertFalse(quote["is_live"])
+
+    def test_provider_stale_flag_is_respected(self):
+        quote = validate_quote(self.payload(stale=True))
+        self.assertTrue(quote["provider_stale"])
+        self.assertTrue(quote["is_stale"])
+        self.assertFalse(quote["is_live"])
 
     def test_rejects_wrong_symbol(self):
         with self.assertRaisesRegex(BiquoteLiveError, "unexpected_symbol"):

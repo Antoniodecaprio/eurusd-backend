@@ -74,7 +74,10 @@ def validate_quote(payload: dict[str, Any], *, received_at: datetime | None = No
         "symbol": "EURUSD",
         "instrument": "EUR/USD",
         "data_type": "live_quote",
-        "upstream_source": "MT5_feed_identity_unverified",
+        "upstream_source": str(payload.get("source") or "biquote_source_unspecified"),
+        "provider_market_state": payload.get("marketState"),
+        "provider_stale": bool(payload.get("stale", False)),
+        "provider_quote_age_seconds": payload.get("quoteAgeSeconds"),
         "source_verified": False,
         "price_basis": "bid_ask",
         "bid": bid,
@@ -85,8 +88,8 @@ def validate_quote(payload: dict[str, Any], *, received_at: datetime | None = No
         "timestamp_utc": stamp.isoformat(),
         "received_at_utc": received.isoformat(),
         "age_seconds": max(0.0, age),
-        "is_live": age <= MAX_QUOTE_AGE_SECONDS,
-        "is_stale": age > MAX_QUOTE_AGE_SECONDS,
+        "is_live": age <= MAX_QUOTE_AGE_SECONDS and not bool(payload.get("stale", False)),
+        "is_stale": age > MAX_QUOTE_AGE_SECONDS or bool(payload.get("stale", False)),
         "historical_consensus_eligible": False,
         "trading_enabled": False,
     }
@@ -138,7 +141,7 @@ class BiquoteSignalRStream:
             self.on_quote(quote)
 
         async def subscribe() -> None:
-            await client.send("Subscribe", ["EURUSD"])
+            await client.send("Subscribe", [["EURUSD"]])
 
         client.on("ReceiveTick", receive)
         client.on_open(lambda: asyncio.create_task(subscribe()))

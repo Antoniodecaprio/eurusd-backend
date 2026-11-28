@@ -46,6 +46,9 @@ def _forecast_log(spot_log: float, fit: tuple[float, float, float], steps: int):
 def _metric_pack(actual, predicted, lower, upper, origin_spot):
     actual = np.asarray(actual, dtype=float)
     predicted = np.asarray(predicted, dtype=float)
+    lower = np.asarray(lower, dtype=float)
+    upper = np.asarray(upper, dtype=float)
+    origin_spot = np.asarray(origin_spot, dtype=float)
     errors = predicted - actual
     actual_direction = np.sign(actual - origin_spot)
     predicted_direction = np.sign(predicted - origin_spot)

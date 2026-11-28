@@ -3,6 +3,7 @@
 This first hosted milestone exposes market-data readiness and diagnostics.
 It intentionally does not manufacture trading forecasts or execute trades.
 """
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import logging
 import os
@@ -12,13 +13,29 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from v6.market_data import fetch_market_snapshot
 from v6.provider_comparison import fetch_provider_evidence
-from v6.biquote_live import BiquoteLiveError, fetch_live_quote, live_quote_store
+from v6.biquote_live import (BiquoteLiveError, fetch_live_quote, live_quote_store, biquote_stream_supervisor)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("eurusd_v6")
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    stream_enabled = os.getenv("BIQUOTE_STREAM_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    if stream_enabled:
+        await biquote_stream_supervisor.start()
+        logger.info("biquote SignalR stream supervisor started")
+    try:
+        yield
+    finally:
+        if stream_enabled:
+            await biquote_stream_supervisor.stop()
+            logger.info("biquote SignalR stream supervisor stopped")
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="EUR/USD Distribution Forecaster v6",
+    lifespan=lifespan,
     version="6.0.0-dev",
     description=(
         "v6 research/staging API. Market-data diagnostics only; "
@@ -222,3 +239,16 @@ def biquote_live_quote():
         "the user's Headway execution feed. Not used in historical consensus or trade execution."
     )
     return quote
+
+
+@app.get("/v6/live-feed-status")
+def biquote_live_feed_status():
+    """Operational status for the managed biquote stream and latest validated tick."""
+    quote = live_quote_store.get()
+    return {
+        "provider": "biquote",
+        "stream": biquote_stream_supervisor.status(),
+        "latest_quote": quote,
+        "historical_consensus_eligible": False,
+        "trading_enabled": False,
+    }

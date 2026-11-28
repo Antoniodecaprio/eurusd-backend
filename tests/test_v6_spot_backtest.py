@@ -25,6 +25,20 @@ class SpotAnchorBacktestTests(unittest.TestCase):
         self.assertGreaterEqual(one_hour["baseline_previous_h1_close"]["n"], 30)
         self.assertIn("ci95", one_hour["paired_mae_difference_bootstrap"])
 
+    def test_directional_metric_uses_each_strategy_origin(self):
+        from v6.spot_backtest import _metric_pack
+        actual = [1.087]
+        predicted = [1.0865]
+        lower, upper = [1.08], [1.09]
+        # From the old origin the forecast predicts up; from the refreshed
+        # origin it predicts down. The metric must respect the supplied origin.
+        old_origin = [1.085]
+        fresh_origin = [1.086]
+        old = _metric_pack(actual, predicted, lower, upper, old_origin)
+        fresh = _metric_pack(actual, predicted, lower, upper, fresh_origin)
+        self.assertEqual(old["directional_accuracy"], 0.0)
+        self.assertEqual(fresh["directional_accuracy"], 0.0)
+
     def test_rejects_insufficient_history(self):
         with self.assertRaises(ValueError):
             run_spot_anchor_backtest(self.synthetic(150), window=300)

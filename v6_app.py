@@ -11,9 +11,10 @@ import os
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from v6.market_data import fetch_market_snapshot
+from v6.market_data import fetch_market_snapshot, fetch_timeframe, MarketDataError
 from v6.provider_comparison import fetch_provider_evidence
 from v6.forecast_context import build_forecast_market_context
+from v6.spot_backtest import run_spot_anchor_backtest
 from v6.biquote_live import (BiquoteLiveError, fetch_live_quote, live_quote_store, biquote_stream_supervisor)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -259,3 +260,33 @@ def forecast_market_context():
     """Expose a validated live-spot candidate without changing model parameters."""
     quote = live_quote_store.get()
     return build_forecast_market_context(quote)
+
+
+@app.get("/v6/spot-anchor-backtest")
+def spot_anchor_backtest(
+    window: int = Query(500, ge=100, le=2000),
+    step: int = Query(4, ge=1, le=24),
+    max_origins: int = Query(1200, ge=30, le=3000),
+):
+    """Compare OU spot anchors using walk-forward historical H1 observations."""
+    try:
+        candles, metadata = fetch_timeframe("H1", minimum_candles=window + 200)
+        if not metadata.get("quality", {}).get("ready"):
+            raise HTTPException(
+                status_code=503,
+                detail={"message": "H1 research history is not ready", "quality": metadata.get("quality")},
+            )
+        result = run_spot_anchor_backtest(
+            candles, window=window, step=step, max_origins=max_origins
+        )
+        result["data_source"] = metadata.get("source")
+        result["data_quality"] = metadata.get("quality")
+        result["data_retrieved_at_utc"] = metadata.get("retrieved_at_utc")
+        return result
+    except HTTPException:
+        raise
+    except (ValueError, MarketDataError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Spot-anchor backtest failed")
+        raise HTTPException(status_code=502, detail=f"Backtest failed: {type(exc).__name__}") from exc

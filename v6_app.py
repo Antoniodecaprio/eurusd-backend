@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from v6.market_data import fetch_market_snapshot
 from v6.provider_comparison import fetch_provider_evidence
+from v6.biquote_live import BiquoteLiveError, fetch_live_quote, live_quote_store
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("eurusd_v6")
@@ -205,3 +206,19 @@ def provider_evidence(
             status_code=502,
             detail=f"Provider evidence failed: {type(exc).__name__}",
         ) from exc
+
+
+@app.get("/v6/live-quote")
+def biquote_live_quote():
+    """Fetch a current biquote bid/ask snapshot; separate from historical evidence."""
+    try:
+        quote = fetch_live_quote()
+        live_quote_store.update(quote)
+    except BiquoteLiveError as exc:
+        logger.warning("biquote live quote unavailable: %s", str(exc))
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    quote["note"] = (
+        "biquote live quote snapshot. The reported MT5 source is not verified as "
+        "the user's Headway execution feed. Not used in historical consensus or trade execution."
+    )
+    return quote

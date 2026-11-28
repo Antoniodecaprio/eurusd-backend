@@ -6,6 +6,7 @@ is deliberately marked unverified until biquote confirms the exact MT5 source.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import os
@@ -112,41 +113,117 @@ def fetch_live_quote(*, timeout: tuple[float, float] = (4, 10)) -> dict[str, Any
 
 
 class BiquoteSignalRStream:
-    """Reconnectable SignalR consumer; callbacks receive validated ticks."""
+    """Managed SignalR consumer; reconnects and re-subscribes after reconnects."""
 
     def __init__(self, on_quote: Callable[[dict[str, Any]], None]):
         self.on_quote = on_quote
         self._client = None
+        self.connected = False
+        self.last_connected_at: str | None = None
+        self.last_message_at: str | None = None
+        self.last_error: str | None = None
+        self.reconnect_count = 0
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "connected": self.connected,
+            "last_connected_at_utc": self.last_connected_at,
+            "last_message_at_utc": self.last_message_at,
+            "last_error": self.last_error,
+            "reconnect_count": self.reconnect_count,
+        }
 
     async def run(self) -> None:
         try:
             from pysignalr.client import SignalRClient
         except ImportError as exc:
+            self.last_error = "pysignalr_not_installed"
             raise RuntimeError("Install pysignalr to enable the biquote SignalR stream") from exc
 
         client = SignalRClient(HUB_URL)
         self._client = client
 
-        def receive(*args: Any) -> None:
-            candidate = args[0] if args else None
-            if isinstance(candidate, list):
-                candidate = candidate[0] if candidate else None
+        async def receive(message: Any) -> None:
+            candidate = message[0] if isinstance(message, list) and message else message
             if not isinstance(candidate, dict):
                 logger.warning("Ignoring malformed biquote SignalR event")
                 return
             try:
                 quote = validate_quote(candidate)
             except BiquoteLiveError as exc:
+                self.last_error = str(exc)
                 logger.warning("Rejected biquote SignalR tick: %s", str(exc))
                 return
+            self.last_message_at = datetime.now(timezone.utc).isoformat()
+            self.last_error = None
             self.on_quote(quote)
 
-        async def subscribe() -> None:
+        async def on_open() -> None:
+            self.connected = True
+            self.last_connected_at = datetime.now(timezone.utc).isoformat()
             await client.send("Subscribe", [["EURUSD"]])
 
+        async def on_close() -> None:
+            self.connected = False
+            self.reconnect_count += 1
+
+        async def on_error(error: Any) -> None:
+            self.last_error = str(getattr(error, "error", error))[:300]
+            logger.warning("biquote SignalR error: %s", self.last_error)
+
         client.on("ReceiveTick", receive)
-        client.on_open(lambda: asyncio.create_task(subscribe()))
+        client.on_open(on_open)
+        client.on_close(on_close)
+        client.on_error(on_error)
         await client.run()
+        self.connected = False
+
+
+class BiquoteStreamSupervisor:
+    """Owns one background stream task and exposes safe operational status."""
+
+    def __init__(self, store: "LiveQuoteStore"):
+        self.store = store
+        self.stream = BiquoteSignalRStream(store.update)
+        self._task: asyncio.Task | None = None
+        self.enabled = False
+
+    async def start(self) -> None:
+        self.enabled = True
+        self._task = asyncio.create_task(self._run_forever(), name="biquote-signalr")
+
+    async def _run_forever(self) -> None:
+        delay = 2.0
+        while self.enabled:
+            try:
+                await self.stream.run()
+                if self.enabled:
+                    self.stream.last_error = "signalr_client_stopped"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.stream.last_error = f"{type(exc).__name__}: {exc}"[:300]
+                logger.exception("biquote SignalR worker failed")
+            if self.enabled:
+                self.stream.connected = False
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60.0)
+
+    async def stop(self) -> None:
+        self.enabled = False
+        if self._task:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+        self.stream.connected = False
+
+    def status(self) -> dict[str, Any]:
+        result = self.stream.status()
+        result["enabled"] = self.enabled
+        result["task_running"] = bool(self._task and not self._task.done())
+        return result
 
 
 class LiveQuoteStore:
@@ -166,3 +243,6 @@ class LiveQuoteStore:
 
 
 live_quote_store = LiveQuoteStore()
+
+
+biquote_stream_supervisor = BiquoteStreamSupervisor(live_quote_store)

@@ -1,0 +1,164 @@
+"""biquote live EUR/USD quote adapter and optional SignalR stream.
+
+Live quotes are kept separate from OHLC research candles. Upstream broker identity
+is deliberately marked unverified until biquote confirms the exact MT5 source.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import os
+import threading
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+import requests
+
+BASE_URL = "https://biquote.io"
+QUOTE_URL = f"{BASE_URL}/api/EURUSD"
+HUB_URL = f"{BASE_URL}/hubs/tick"
+MAX_QUOTE_AGE_SECONDS = float(os.getenv("BIQUOTE_MAX_QUOTE_AGE_SECONDS", "30"))
+MAX_SPREAD_PIPS = float(os.getenv("BIQUOTE_MAX_SPREAD_PIPS", "5.0"))
+PIP_SIZE = 0.0001
+logger = logging.getLogger("eurusd_v6.biquote_live")
+
+
+class BiquoteLiveError(RuntimeError):
+    """biquote quote is unavailable or invalid."""
+
+
+def _parse_timestamp(value: Any) -> datetime:
+    if value is None:
+        raise BiquoteLiveError("quote_timestamp_missing")
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError) as exc:
+        raise BiquoteLiveError("quote_timestamp_invalid") from exc
+
+
+def validate_quote(payload: dict[str, Any], *, received_at: datetime | None = None) -> dict[str, Any]:
+    """Validate a raw biquote tick without inventing a broker identity."""
+    if not isinstance(payload, dict):
+        raise BiquoteLiveError("quote_payload_invalid")
+    symbol = str(payload.get("symbol", "EURUSD")).upper().replace("/", "")
+    if symbol != "EURUSD":
+        raise BiquoteLiveError("unexpected_symbol")
+    try:
+        bid, ask = float(payload["bid"]), float(payload["ask"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BiquoteLiveError("bid_ask_missing_or_invalid") from exc
+    if not math.isfinite(bid) or not math.isfinite(ask) or bid <= 0 or ask <= 0:
+        raise BiquoteLiveError("non_positive_or_non_finite_price")
+    if ask < bid:
+        raise BiquoteLiveError("ask_below_bid")
+    stamp = _parse_timestamp(
+        payload.get("timestamp") or payload.get("time") or payload.get("updatedAt")
+    )
+    received = received_at or datetime.now(timezone.utc)
+    if received.tzinfo is None:
+        received = received.replace(tzinfo=timezone.utc)
+    received = received.astimezone(timezone.utc)
+    age = (received - stamp).total_seconds()
+    # Small future skew is tolerated; materially future-dated ticks are rejected.
+    if age < -5:
+        raise BiquoteLiveError("quote_timestamp_in_future")
+    spread_pips = (ask - bid) / PIP_SIZE
+    if spread_pips > MAX_SPREAD_PIPS:
+        raise BiquoteLiveError("spread_above_configured_limit")
+    return {
+        "provider": "biquote",
+        "symbol": "EURUSD",
+        "instrument": "EUR/USD",
+        "data_type": "live_quote",
+        "upstream_source": "MT5_feed_identity_unverified",
+        "source_verified": False,
+        "price_basis": "bid_ask",
+        "bid": bid,
+        "ask": ask,
+        "mid": (bid + ask) / 2.0,
+        "spread": ask - bid,
+        "spread_pips": spread_pips,
+        "timestamp_utc": stamp.isoformat(),
+        "received_at_utc": received.isoformat(),
+        "age_seconds": max(0.0, age),
+        "is_live": age <= MAX_QUOTE_AGE_SECONDS,
+        "is_stale": age > MAX_QUOTE_AGE_SECONDS,
+        "historical_consensus_eligible": False,
+        "trading_enabled": False,
+    }
+
+
+def fetch_live_quote(*, timeout: tuple[float, float] = (4, 10)) -> dict[str, Any]:
+    """Fetch one REST quote; intended for initial snapshot and recovery only."""
+    try:
+        response = requests.get(QUOTE_URL, timeout=timeout)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.Timeout as exc:
+        raise BiquoteLiveError("biquote_quote_timeout") from exc
+    except requests.RequestException as exc:
+        raise BiquoteLiveError(f"biquote_transport_error:{type(exc).__name__}") from exc
+    except ValueError as exc:
+        raise BiquoteLiveError("biquote_invalid_json") from exc
+    return validate_quote(payload)
+
+
+class BiquoteSignalRStream:
+    """Reconnectable SignalR consumer; callbacks receive validated ticks."""
+
+    def __init__(self, on_quote: Callable[[dict[str, Any]], None]):
+        self.on_quote = on_quote
+        self._client = None
+
+    async def run(self) -> None:
+        try:
+            from pysignalr.client import SignalRClient
+        except ImportError as exc:
+            raise RuntimeError("Install pysignalr to enable the biquote SignalR stream") from exc
+
+        client = SignalRClient(HUB_URL)
+        self._client = client
+
+        def receive(*args: Any) -> None:
+            candidate = args[0] if args else None
+            if isinstance(candidate, list):
+                candidate = candidate[0] if candidate else None
+            if not isinstance(candidate, dict):
+                logger.warning("Ignoring malformed biquote SignalR event")
+                return
+            try:
+                quote = validate_quote(candidate)
+            except BiquoteLiveError as exc:
+                logger.warning("Rejected biquote SignalR tick: %s", str(exc))
+                return
+            self.on_quote(quote)
+
+        async def subscribe() -> None:
+            await client.send("Subscribe", ["EURUSD"])
+
+        client.on("ReceiveTick", receive)
+        client.on_open(lambda: asyncio.create_task(subscribe()))
+        await client.run()
+
+
+class LiveQuoteStore:
+    """Thread-safe latest-quote cache used by the API and stream callback."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._quote: dict[str, Any] | None = None
+
+    def update(self, quote: dict[str, Any]) -> None:
+        with self._lock:
+            self._quote = dict(quote)
+
+    def get(self) -> dict[str, Any] | None:
+        with self._lock:
+            return dict(self._quote) if self._quote else None
+
+
+live_quote_store = LiveQuoteStore()

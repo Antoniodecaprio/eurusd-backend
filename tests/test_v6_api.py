@@ -57,6 +57,14 @@ class V6ApiTests(unittest.TestCase):
         self.assertNotIn("candles", data["timeframes"]["M15"])
         self.assertFalse(data["trading_enabled"])
 
+    def test_forecast_market_context_fails_closed_without_live_quote(self):
+        response = self.client.get("/v6/forecast-market-context")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "unavailable")
+        self.assertFalse(data["historical_data_modified"])
+        self.assertFalse(data["trading_enabled"])
+
     def test_root_identifies_staging(self):
         data = self.client.get("/").json()
         self.assertEqual(data["version"], "6.0.0-dev")

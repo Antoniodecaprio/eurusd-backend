@@ -156,11 +156,13 @@ def run_spot_anchor_backtest(
             continue
         actual = np.asarray(r["actual"])
         base_pred, fresh_pred = np.asarray(r["baseline"]), np.asarray(r["fresh"])
+        # Score direction from each strategy's own information set.
+        # The baseline only knows close[t-1]; the refreshed variant knows close[t].
         baseline_metrics = _metric_pack(
-            actual, base_pred, r["lower_base"], r["upper_base"], r["origin"]
+            actual, base_pred, r["lower_base"], r["upper_base"], r["baseline_origin"]
         )
         fresh_metrics = _metric_pack(
-            actual, fresh_pred, r["lower_fresh"], r["upper_fresh"], r["origin"]
+            actual, fresh_pred, r["lower_fresh"], r["upper_fresh"], r["fresh_origin"]
         )
         base_mae, fresh_mae = baseline_metrics["mae"], fresh_metrics["mae"]
         results[str(h)] = {

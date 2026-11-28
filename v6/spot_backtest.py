@@ -130,7 +130,7 @@ def run_spot_anchor_backtest(
         stale_log, fresh_log = log_prices[t - 1], log_prices[t]
         for h in hs:
             actual = prices[t + h]
-            mu_b, var_b = _forecast_log(stale_log, fit, h)
+            mu_b, var_b = _forecast_log(stale_log, fit, h + 1)
             mu_f, var_f = _forecast_log(fresh_log, fit, h)
             z90 = 1.6448536269514722
             sd_b, sd_f = np.sqrt(var_b), np.sqrt(var_f)

@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 import requests
 
 from v6.biquote_live import (
-    BiquoteLiveError, LiveQuoteStore, fetch_live_quote, validate_quote,
+    BiquoteLiveError, BiquoteSignalRStream, LiveQuoteStore, fetch_live_quote, validate_quote,
 )
 
 
@@ -79,6 +79,14 @@ class BiquoteLiveTests(unittest.TestCase):
         get.side_effect = requests.Timeout()
         with self.assertRaisesRegex(BiquoteLiveError, "biquote_quote_timeout"):
             fetch_live_quote()
+
+    def test_signalr_stream_validates_tick_and_updates_cache(self):
+        store = LiveQuoteStore()
+        stream = BiquoteSignalRStream(store.update)
+        stream.last_message_at = datetime.now(timezone.utc).isoformat()
+        tick = validate_quote(self.payload())
+        stream.on_quote(tick)
+        self.assertEqual(store.get()["provider"], "biquote")
 
     def test_store_returns_copy(self):
         store = LiveQuoteStore()

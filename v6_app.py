@@ -3,6 +3,7 @@
 This first hosted milestone exposes market-data readiness and diagnostics.
 It intentionally does not manufacture trading forecasts or execute trades.
 """
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import logging
 import os
@@ -10,14 +11,32 @@ import os
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from v6.market_data import fetch_market_snapshot
+from v6.market_data import fetch_market_snapshot, fetch_timeframe, MarketDataError
 from v6.provider_comparison import fetch_provider_evidence
+from v6.forecast_context import build_forecast_market_context
+from v6.spot_backtest import run_spot_anchor_backtest
+from v6.biquote_live import (BiquoteLiveError, fetch_live_quote, live_quote_store, biquote_stream_supervisor)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("eurusd_v6")
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    stream_enabled = os.getenv("BIQUOTE_STREAM_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+    if stream_enabled:
+        await biquote_stream_supervisor.start()
+        logger.info("biquote SignalR stream supervisor started")
+    try:
+        yield
+    finally:
+        if stream_enabled:
+            await biquote_stream_supervisor.stop()
+            logger.info("biquote SignalR stream supervisor stopped")
+
+
 app = FastAPI(
     title="EUR/USD Distribution Forecaster v6",
+    lifespan=lifespan,
     version="6.0.0-dev",
     description=(
         "v6 research/staging API. Market-data diagnostics only; "
@@ -205,3 +224,69 @@ def provider_evidence(
             status_code=502,
             detail=f"Provider evidence failed: {type(exc).__name__}",
         ) from exc
+
+
+@app.get("/v6/live-quote")
+def biquote_live_quote():
+    """Fetch a current biquote bid/ask snapshot; separate from historical evidence."""
+    try:
+        quote = fetch_live_quote()
+        live_quote_store.update(quote)
+    except BiquoteLiveError as exc:
+        logger.warning("biquote live quote unavailable: %s", str(exc))
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    quote["note"] = (
+        "biquote live quote snapshot. The reported MT5 source is not verified as "
+        "the user's Headway execution feed. Not used in historical consensus or trade execution."
+    )
+    return quote
+
+
+@app.get("/v6/live-feed-status")
+def biquote_live_feed_status():
+    """Operational status for the managed biquote stream and latest validated tick."""
+    quote = live_quote_store.get()
+    return {
+        "provider": "biquote",
+        "stream": biquote_stream_supervisor.status(),
+        "latest_quote": quote,
+        "historical_consensus_eligible": False,
+        "trading_enabled": False,
+    }
+
+
+@app.get("/v6/forecast-market-context")
+def forecast_market_context():
+    """Expose a validated live-spot candidate without changing model parameters."""
+    quote = live_quote_store.get()
+    return build_forecast_market_context(quote)
+
+
+@app.get("/v6/spot-anchor-backtest")
+def spot_anchor_backtest(
+    window: int = Query(500, ge=100, le=2000),
+    step: int = Query(4, ge=1, le=24),
+    max_origins: int = Query(1200, ge=30, le=3000),
+):
+    """Compare OU spot anchors using walk-forward historical H1 observations."""
+    try:
+        candles, metadata = fetch_timeframe("H1", minimum_candles=window + 200)
+        if not metadata.get("quality", {}).get("ready"):
+            raise HTTPException(
+                status_code=503,
+                detail={"message": "H1 research history is not ready", "quality": metadata.get("quality")},
+            )
+        result = run_spot_anchor_backtest(
+            candles, window=window, step=step, max_origins=max_origins
+        )
+        result["data_source"] = metadata.get("source")
+        result["data_quality"] = metadata.get("quality")
+        result["data_retrieved_at_utc"] = metadata.get("retrieved_at_utc")
+        return result
+    except HTTPException:
+        raise
+    except (ValueError, MarketDataError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Spot-anchor backtest failed")
+        raise HTTPException(status_code=502, detail=f"Backtest failed: {type(exc).__name__}") from exc

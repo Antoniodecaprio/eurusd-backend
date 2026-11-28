@@ -14,3 +14,12 @@ M15 TTL 60s; H1 300s; D1 3600s; provider rate-limit cooldown 120s. M15/H1/D1 sup
 
 ## Deployment
 Green CI does not prove Render runs that commit. Verify deployment commit and health. Details above are from project context and should be re-audited against source and live service.
+
+## Current v6 release candidate additions
+- Live quote: `GET /v6/live-quote`; read-only BiQuote snapshot, separate from historical candles.
+- Stream status: `GET /v6/live-feed-status`.
+- Forecast context: `GET /v6/forecast-market-context`; candidate spot only, no model injection.
+- Research backtest: `GET /v6/spot-anchor-backtest`; historical H1 walk-forward comparison only.
+- The BiQuote SignalR worker is opt-in. Set `BIQUOTE_STREAM_ENABLED=true` only after the provider connection is verified in the target deployment. It defaults off so an unavailable optional streaming dependency/provider cannot destabilize API startup.
+- Set `CORS_ORIGINS` to the exact FlutterFlow web origins that need API access. Do not use wildcard origins with credentials.
+- v6 dependencies: `requirements-v6.txt`; CI installs the full `requirements.txt` so it exercises both legacy imports and the v6 SignalR dependency.

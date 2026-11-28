@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from v6.market_data import fetch_market_snapshot
 from v6.provider_comparison import fetch_provider_evidence
+from v6.forecast_context import build_forecast_market_context
 from v6.biquote_live import (BiquoteLiveError, fetch_live_quote, live_quote_store, biquote_stream_supervisor)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -251,3 +252,10 @@ def biquote_live_feed_status():
         "historical_consensus_eligible": False,
         "trading_enabled": False,
     }
+
+
+@app.get("/v6/forecast-market-context")
+def forecast_market_context():
+    """Expose a validated live-spot candidate without changing model parameters."""
+    quote = live_quote_store.get()
+    return build_forecast_market_context(quote)
